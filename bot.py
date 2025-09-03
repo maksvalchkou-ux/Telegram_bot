@@ -2,6 +2,7 @@ import os
 import re
 import random
 import threading
+import html
 from datetime import datetime, timedelta, timezone
 from typing import Dict, Optional, Set, Tuple, List
 
@@ -11,7 +12,7 @@ from telegram.ext import (
     Application, ApplicationBuilder, CommandHandler, CallbackQueryHandler,
     MessageHandler, ContextTypes, filters
 )
-from telegram.request import HTTPXRequest  # «тихий» polling с таймаутами
+from telegram.request import HTTPXRequest
 
 # ========= НАСТРОЙКИ =========
 API_TOKEN = os.getenv("BOT_TOKEN")
@@ -25,7 +26,6 @@ TRIGGER_COOLDOWN = timedelta(seconds=20)
 # Лимит репутации: сколько выдач (+/-) один пользователь может сделать за 24 часа
 REP_DAILY_LIMIT = 10
 REP_WINDOW = timedelta(hours=24)
-
 UTC = timezone.utc
 
 # ========= ТЕКСТЫ =========
@@ -89,8 +89,8 @@ BEER_HITS: Dict[int, int] = {}            # user_id -> сколько раз с�
 LAST_MSG_AT: Dict[int, datetime] = {}     # user_id -> последний момент, когда писал
 
 # — админ-взаимодействия
-ADMIN_PLUS_GIVEN: Dict[int, int] = {}     # user_id -> скольким +1 поставил админам
-ADMIN_MINUS_GIVEN: Dict[int, int] = {}    # user_id -> скольким -1 поставил админам
+ADMIN_PLUS_GIVEN: Dict[int, int] = {}     # user_id -> сколько раз поставил +1 админам
+ADMIN_MINUS_GIVEN: Dict[int, int] = {}    # user_id -> сколько раз поставил -1 админам
 
 # — ачивки
 ACHIEVEMENTS: Dict[int, Set[str]] = {}    # user_id -> set(title)
@@ -104,7 +104,7 @@ def _achieve(user_id: int, title: str) -> bool:
 
 # ========= АЧИВКИ (название -> (описание, условие-объяснение)) =========
 ACH_LIST: Dict[str, Tuple[str, str]] = {
-    # уже были
+    # базовые
     "Читер ёбаный":         ("попытка поставить +1 самому себе",         "Сам себе +1 — нельзя."),
     "Никофил ебучий":       ("5 смен никнейма",                           "Сменил ник ≥ 5 раз."),
     "Ник-коллекционер":     ("10 смен никнейма",                          "Сменил ник ≥ 10 раз."),
@@ -114,25 +114,25 @@ ACH_LIST: Dict[str, Tuple[str, str]] = {
     "Токсик-магнит":        ("ушёл в минус по репе",                      "Полученная репа ≤ -10."),
     "Пивной сомелье-алкаш": ("5 раз триггерил «пиво»",                    "«Пиво»-триггеров ≥ 5."),
     "Пивозавр":             ("20 «пивных» триггеров",                     "«Пиво»-триггеров ≥ 20."),
-    "Шароман долбанный":    ("/8ball вызван 10 раз",                       "Вызовов /8ball ≥ 10."),
+    "Шароман долбанный":    ("/8ball вызван 10 раз",                      "Вызовов /8ball ≥ 10."),
     "Клаводробилка":        ("настрочил 5000 символов",                   "Символов ≥ 5000."),
     "Писарь-маховик":       ("накидал 100 сообщений",                     "Сообщений ≥ 100."),
     "Триггер-мейкер":       ("15 раз триггерил бота",                     "Любых триггеров ≥ 15."),
-    # новые (твоё ТЗ)
+    # взаимодействия с админом и «соц» очивки
     "Тронолом":             ("менял ник админа",                          "Сменил ник пользователю-админу."),
-    "Подхалим генеральский":("поставил +1 админу 5 раз",                   "Выдал +1 админам ≥ 5."),
-    "Ужалил короля":        ("влепил -1 админам 3 раза",                   "Выдал -1 админам ≥ 3."),
-    "Крутой чел":           ("накопил солидную репу",                      "Полученная репутация ≥ 50."),
-    "Опущенный":            ("опустился по репутации ниже плинтуса",       "Полученная репутация ≤ -20."),
-    "Пошёл смотреть коров": ("пропадал 5 дней",                            "Перерыв между сообщениями ≥ 5 дней."),
-    "Споткнулся о ***":     ("пропадал 3 дня",                             "Перерыв между сообщениями ≥ 3 дней."),
-    "Сортирный поэт":       ("устойчиво шутит ниже пояса",                 "Часто упоминает NSFW-слова (без хейта)."),
-    # ещё 5 доп. от меня
-    "Король репы":          ("репутация как у бога",                       "Полученная репутация ≥ 100."),
-    "Минусатор-маньяк":     ("раздал -1 десять раз",                       "Выдано -1 ≥ 10."),
-    "Флудераст":            ("спамил как шаман",                           "Сообщений ≥ 300."),
-    "Словесный понос":      ("разлил океан текста",                        "Символов ≥ 20000."),
-    "Секретный дрочер шара":("подсел на 8ball",                            "Вызовов /8ball ≥ 30."),
+    "Подхалим генеральский":("поставил +1 админу 5 раз",                  "Выдал +1 админам ≥ 5."),
+    "Ужалил короля":        ("влепил -1 админам 3 раза",                  "Выдал -1 админам ≥ 3."),
+    "Крутой чел":           ("накопил солидную репу",                     "Полученная репутация ≥ 50."),
+    "Опущенный":            ("опустился по репутации ниже плинтуса",      "Полученная репутация ≤ -20."),
+    "Пошёл смотреть коров": ("пропадал 5 дней",                           "Перерыв ≥ 5 дней."),
+    "Споткнулся о ***":     ("пропадал 3 дня",                            "Перерыв ≥ 3 дня."),
+    "Сортирный поэт":       ("шутит ниже пояса",                          "NSFW-слова в сообщениях."),
+    # большие цифры
+    "Король репы":          ("репутация как у бога",                      "Полученная репутация ≥ 100."),
+    "Минусатор-маньяк":     ("раздал -1 десять раз",                      "Выдано -1 ≥ 10."),
+    "Флудераст":            ("спамил как шаман",                          "Сообщений ≥ 300."),
+    "Словесный понос":      ("разлил океан текста",                       "Символов ≥ 20000."),
+    "Секретный дрочер шара":("подсел на 8ball",                           "Вызовов /8ball ≥ 30."),
 }
 
 # Пороги
@@ -206,12 +206,10 @@ TRIGGERS = [
 
 # ========= УТИЛИТЫ =========
 def _display_name(u: User) -> str:
-    if u.username:
-        return f"@{u.username}"
-    return u.full_name or f"id{u.id}"
+    return f"@{u.username}" if u.username else (u.full_name or f"id{u.id}")
 
 async def _remember_user(u: Optional[User]):
-    if not u:
+    if not u: 
         return
     if u.username:
         KNOWN[u.username.lower()] = u.id
@@ -274,9 +272,6 @@ async def _is_admin(chat_id: int, user_id: int, context: ContextTypes.DEFAULT_TY
     except Exception:
         return False
 
-def _name_or_id(uid: int) -> str:
-    return NAMES.get(uid, f"id{uid}")
-
 def _within_limit_and_mark(giver_id: int) -> Tuple[bool, Optional[int]]:
     """Проверка дневного лимита выдачи репутации (±1) за 24 часа.
        Возвращает (ok, secs_left_until_free_slot)."""
@@ -286,7 +281,6 @@ def _within_limit_and_mark(giver_id: int) -> Tuple[bool, Optional[int]]:
     arr = [t for t in arr if now - t < REP_WINDOW]
     REP_GIVE_TIMES[giver_id] = arr
     if len(arr) >= REP_DAILY_LIMIT:
-        # время до освобождения слота — до самого старого в окне
         oldest = min(arr)
         secs = int((oldest + REP_WINDOW - now).total_seconds())
         return False, max(1, secs)
@@ -294,6 +288,9 @@ def _within_limit_and_mark(giver_id: int) -> Tuple[bool, Optional[int]]:
     arr.append(now)
     REP_GIVE_TIMES[giver_id] = arr
     return True, None
+
+def _name_or_id(uid: int) -> str:
+    return NAMES.get(uid, f"id{uid}")
 
 # ========= КОМАНДЫ/КНОПКИ =========
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -316,7 +313,7 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == BTN_STATS:
         await q.message.reply_text(build_stats_text(update.effective_chat.id), reply_markup=main_keyboard())
     elif data == BTN_ACH:
-        await q.message.reply_text(build_achievements_catalog(), reply_markup=main_keyboard(), parse_mode="Markdown")
+        await q.message.reply_text(build_achievements_catalog(), reply_markup=main_keyboard(), parse_mode="HTML")
     else:
         await q.message.reply_text("¯\\_(ツ)_/¯ Неизвестная кнопка", reply_markup=main_keyboard())
 
@@ -407,7 +404,7 @@ async def cmd_8ball(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     await update.message.reply_text(random.choice(EIGHT_BALL))
 
-# ---- ЕДИНЫЙ ОБРАБОТЧИК ТЕКСТА: счётчики → репутация → триггеры/NSFW ----
+# ---- ЕДИНЫЙ ОБРАБОТЧИК ТЕКСТА: счётчики → репутация → триггеры/NSFW/AFK ----
 REP_CMD = re.compile(r"^[\+\-]1(\b|$)", re.IGNORECASE)
 
 def _trigger_allowed(chat_id: int) -> bool:
@@ -428,7 +425,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # запомним имя/@username
     await _remember_user(msg.from_user)
 
-    # === 0) Инфо об «афк» — смотрим разрыв с прошлого сообщения ===
+    # === 0) AFK-ачивки: проверяем разрыв с прошлого сообщения ===
     now = datetime.now(UTC)
     uid = msg.from_user.id
     if uid in LAST_MSG_AT:
@@ -443,7 +440,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (msg.text or "")
     _inc(MSG_COUNT, uid)
     _inc(CHAR_COUNT, uid, by=len(text))
-    # ачивки по объёмам
+    # объёмные ачивки
     if CHAR_COUNT.get(uid, 0) >= TH_CHARS_1 and _achieve(uid, "Клаводробилка"):
         await _announce_achievement(context, update.effective_chat.id, uid, "Клаводробилка")
     if CHAR_COUNT.get(uid, 0) >= TH_CHARS_2 and _achieve(uid, "Словесный понос"):
@@ -485,11 +482,11 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # лимит выдач за 24 часа
         ok, secs_left = _within_limit_and_mark(giver.id)
         if not ok:
-            # лёгкая подсказка, когда освободится слот
             mins = (secs_left or 60) // 60
             await msg.reply_text(f"Лимит репутации на 24 часа исчерпан (10/10). Попробуй через ~{mins} мин.")
             return
 
+        # запрет «+1 себе»
         if is_plus and target_id == giver.id:
             if _achieve(giver.id, "Читер ёбаный"):
                 await msg.reply_text("«Читер ёбаный» 🏅 — за попытку +1 себе. Нельзя!")
@@ -519,7 +516,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception:
             pass
 
-        # большие реп-ачивки
+        # большие реп-ачивки для цели
         if REP_RECEIVED.get(target_id, 0) >= TH_LOVED and _achieve(target_id, "Любимчик, сука"):
             await _announce_achievement(context, update.effective_chat.id, target_id, "Любимчик, сука")
         if REP_RECEIVED.get(target_id, 0) <= TH_TOXIC and _achieve(target_id, "Токсик-магнит"):
@@ -529,14 +526,12 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if REP_RECEIVED.get(target_id, 0) <= TH_DOWN and _achieve(target_id, "Опущенный"):
             await _announce_achievement(context, update.effective_chat.id, target_id, "Опущенный")
 
-        # «Заводила-плюсовик» — любая выдача 20 раз
+        # «Заводила-плюсовик» и «Щедрый засранец», «Минусатор-маньяк»
         total_gives = REP_POS_GIVEN.get(giver.id, 0) + REP_NEG_GIVEN.get(giver.id, 0)
         if total_gives >= TH_GIVER_ANY and _achieve(giver.id, "Заводила-плюсовик"):
             await _announce_achievement(context, update.effective_chat.id, giver.id, "Заводила-плюсовик")
-        # «Щедрый засранец»
         if REP_POS_GIVEN.get(giver.id, 0) >= TH_GIVER_POS and _achieve(giver.id, "Щедрый засранец"):
             await _announce_achievement(context, update.effective_chat.id, giver.id, "Щедрый засранец")
-        # «Минусатор-маньяк»
         if REP_NEG_GIVEN.get(giver.id, 0) >= 10 and _achieve(giver.id, "Минусатор-маньяк"):
             await _announce_achievement(context, update.effective_chat.id, giver.id, "Минусатор-маньяк")
 
@@ -545,7 +540,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await msg.reply_text(f"{_name_or_id(target_id)} получает {sign}1. Текущая репа: {total}")
         return  # после репы триггеры не обрабатываем
 
-    # === 3) Триггеры и NSFW-счётчик ===
+    # === 3) Триггеры ===
     for idx, (pattern, answers) in enumerate(TRIGGERS):
         if pattern.search(t):
             if _trigger_allowed(update.effective_chat.id):
@@ -563,14 +558,9 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         await _announce_achievement(context, update.effective_chat.id, uid, "Пивозавр")
             break
 
-    # NSFW-нейтральные упоминания — прокачиваем «Сортирный поэт»
+    # === 4) NSFW-детект для «Сортирный поэт» ===
     if NSFW_WORDS.search(t):
-        # лёгкий антиспам: не чаще, чем раз в TRIGGER_COOLDOWN считаем
-        _inc(TRIGGER_HITS, uid)  # тоже считаем в общие триггеры
-        if TRIGGER_HITS.get(uid, 0) >= 15 and _achieve(uid, "Триггер-мейкер"):
-            await _announce_achievement(context, update.effective_chat.id, uid, "Триггер-мейкер")
-        # сам поэт:
-        # дадим ачивку при первом попадании, без сложных порогов (можно усложнить позже)
+        # дадим ачивку при первом попадании
         if _achieve(uid, "Сортирный поэт"):
             await _announce_achievement(context, update.effective_chat.id, uid, "Сортирный поэт")
 
@@ -608,10 +598,13 @@ def build_stats_text(chat_id: int) -> str:
     )
 
 def build_achievements_catalog() -> str:
-    lines = ["🏅 Список возможных ачивок:\n"]
+    lines = ["🏅 Список возможных ачивок:<br/>"]
     for title, (desc, cond) in ACH_LIST.items():
-        lines.append(f"• *{title}* — {desc} _(условие: {cond})_")
-    return "\n".join(lines)
+        lines.append(
+            f"• <b>{html.escape(title)}</b> — {html.escape(desc)} "
+            f"<i>(условие: {html.escape(cond)})</i>"
+        )
+    return "<br/>".join(lines)
 
 # ========= HEALTH для Render =========
 app = Flask(__name__)
@@ -635,7 +628,7 @@ def main():
     # маленький веб-сервер: Render любит, когда кто-то слушает порт
     threading.Thread(target=run_flask, daemon=True).start()
 
-    # «тихие» таймауты для polling (меньше конфликтов в логах на free)
+    # «тихие» таймауты для polling (меньше конфликтов на free)
     req = HTTPXRequest(connect_timeout=10.0, read_timeout=25.0, pool_timeout=5.0)
 
     application: Application = (
