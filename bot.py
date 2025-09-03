@@ -3,7 +3,7 @@ import re
 import random
 import threading
 from datetime import datetime, timedelta
-from typing import Dict, Optional, Set, Tuple
+from typing import Dict, Optional, Set
 
 from flask import Flask
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, User
@@ -11,16 +11,15 @@ from telegram.ext import (
     Application, ApplicationBuilder, CommandHandler, CallbackQueryHandler,
     MessageHandler, ContextTypes, filters
 )
-from telegram.request import HTTPXRequest  # таймауты для polling
+from telegram.request import HTTPXRequest  # тихий polling с таймаутами
 
 # ========= НАСТРОЙКИ =========
 API_TOKEN = os.getenv("BOT_TOKEN")
 if not API_TOKEN:
     raise RuntimeError("BOT_TOKEN is not set")
 
-# Кулдаун на генерацию ника инициатором (для теста 10 сек; потом можно на час)
+# Кулдаун на генерацию никнейма инициатором (для теста 10 сек; потом можно на час)
 NICK_COOLDOWN = timedelta(seconds=10)
-
 # Антиспам для авто-триггеров (на чат)
 TRIGGER_COOLDOWN = timedelta(seconds=20)
 
@@ -29,66 +28,66 @@ WELCOME_TEXT = (
     "Привет! Я ваш ламповый бот для чата 🔥\n\n"
     "Жми кнопки ниже, чтобы посмотреть, что я умею, или открыть статистику и ачивки."
 )
-
 HELP_TEXT = (
-    "🛠 Что умеет этот бот (v3: ники + триггеры + 8ball + репутация):\n"
+    "🛠 Что умеет этот бот (v3.1):\n"
     "• /start — меню с кнопками\n"
-    "• /nick — сгенерировать ник себе\n"
-    "• /nick @user или ответом — ник другу (включая админа)\n"
+    "• /nick — ник себе; /nick @user или ответом — ник другу (включая админа)\n"
     "• /8ball вопрос — магический шар отвечает\n"
     "• Репутация: +1/-1 по реплаю или +1 @user / -1 @user\n"
-    "  (самому себе +1 нельзя — получишь ачивку «Читер ёбаный»)\n"
-    "• Автоответы на ключевые слова (работа, пиво, сон, зал, деньги, привет/пока, любовь)\n"
-    "• Антиповторы и кулдауны\n\n"
-    "Сoon: расширенная статистика и ачивки."
+    "  (самому себе +1 нельзя — ачивка «Читер ёбаный»)\n"
+    "• Автоответы по ключевым словам (пиво, работа, сон, зал, деньги, привет/пока, любовь)\n"
+    "• Статистика: топ по репутации, текущие ники и активность (смс/символы)\n"
 )
+STATS_TITLE = "📊 Статистика"
 
 # ========= КНОПКИ =========
-BTN_HELP = "help_info"
+BTN_HELP  = "help_info"
 BTN_STATS = "stats_open"
-BTN_ACH = "ach_list"
+BTN_ACH   = "ach_list"
 
 def main_keyboard() -> InlineKeyboardMarkup:
-    keyboard = [
+    return InlineKeyboardMarkup([
         [InlineKeyboardButton("🧰 Что умеет этот бот", callback_data=BTN_HELP)],
         [
             InlineKeyboardButton("📊 Статистика", callback_data=BTN_STATS),
-            InlineKeyboardButton("🏅 Ачивки", callback_data=BTN_ACH),
+            InlineKeyboardButton("🏅 Ачивки",    callback_data=BTN_ACH),
         ],
-    ]
-    return InlineKeyboardMarkup(keyboard)
+    ])
 
 # ========= ПАМЯТЬ (in-memory) =========
-# ники
-NICKS: Dict[int, Dict[int, str]] = {}           # chat_id -> { user_id: nick }
-TAKEN: Dict[int, Set[str]] = {}                 # chat_id -> set(nick)
-LAST_NICK: Dict[int, datetime] = {}             # initiator_id -> last nick time
-KNOWN: Dict[str, int] = {}                      # username_lower -> user_id
+# — ники
+NICKS: Dict[int, Dict[int, str]] = {}     # chat_id -> { user_id: nick }
+TAKEN: Dict[int, Set[str]] = {}           # chat_id -> set(nick)
+LAST_NICK: Dict[int, datetime] = {}       # initiator_id -> last nick time
 
-# триггеры
-LAST_TRIGGER_TIME: Dict[int, datetime] = {}     # chat_id -> last trigger response time
+# — известные @username и имена
+KNOWN: Dict[str, int] = {}                # username_lower -> user_id
+NAMES: Dict[int, str] = {}                # user_id -> last display name (@username > full_name)
 
-# репутация
-REP_GIVEN: Dict[int, int] = {}                  # user_id -> сколько выдал (+1/-1 суммарно)
-REP_RECEIVED: Dict[int, int] = {}               # user_id -> сколько получил
-REP_POS_GIVEN: Dict[int, int] = {}              # user_id -> выдано +1
-REP_NEG_GIVEN: Dict[int, int] = {}              # user_id -> выдано -1
+# — триггеры
+LAST_TRIGGER_TIME: Dict[int, datetime] = {}  # chat_id -> last trigger time
 
-# счётчики
-MSG_COUNT: Dict[int, int] = {}                  # user_id -> сообщений
-CHAR_COUNT: Dict[int, int] = {}                 # user_id -> символов
-NICK_CHANGE_COUNT: Dict[int, int] = {}          # user_id -> сколько раз меняли ник
-EIGHTBALL_COUNT: Dict[int, int] = {}            # user_id -> вызовов 8ball
-TRIGGER_HITS: Dict[int, int] = {}               # user_id -> сколько раз триггерил бот
+# — репутация
+REP_GIVEN: Dict[int, int] = {}            # user_id -> суммарно выдал (+/-)
+REP_RECEIVED: Dict[int, int] = {}         # user_id -> суммарно получил
+REP_POS_GIVEN: Dict[int, int] = {}
+REP_NEG_GIVEN: Dict[int, int] = {}
 
-# ачивки
-ACHIEVEMENTS: Dict[int, Set[str]] = {}          # user_id -> set(title)
+# — счётчики
+MSG_COUNT: Dict[int, int] = {}            # user_id -> сообщений
+CHAR_COUNT: Dict[int, int] = {}           # user_id -> символов
+NICK_CHANGE_COUNT: Dict[int, int] = {}    # user_id -> сколько раз меняли ник
+EIGHTBALL_COUNT: Dict[int, int] = {}      # user_id -> вызовов 8ball
+TRIGGER_HITS: Dict[int, int] = {}         # user_id -> сколько раз триггерил бот
+
+# — ачивки
+ACHIEVEMENTS: Dict[int, Set[str]] = {}    # user_id -> set(title)
 
 def _achieve(user_id: int, title: str) -> bool:
-    s = ACHIEVEMENTS.setdefault(user_id, set())
-    if title in s:
+    got = ACHIEVEMENTS.setdefault(user_id, set())
+    if title in got:
         return False
-    s.add(title)
+    got.add(title)
     return True
 
 # ========= СЛОВАРИ ДЛЯ НИКОВ =========
@@ -137,18 +136,25 @@ TRIGGERS = [
 ]
 
 # ========= УТИЛИТЫ =========
-def _user_key(u: User) -> str:
-    return f"@{u.username}" if u.username else (u.full_name or f"id{u.id}")
+def _display_name(u: User) -> str:
+    if u.username:
+        return f"@{u.username}"
+    return u.full_name or f"id{u.id}"
+
+async def _remember_user(u: Optional[User]):
+    if not u:
+        return
+    if u.username:
+        KNOWN[u.username.lower()] = u.id
+        NAMES[u.id] = f"@{u.username}"
+    else:
+        NAMES[u.id] = u.full_name or f"id{u.id}"
 
 def _ensure_chat(chat_id: int):
     if chat_id not in NICKS:
         NICKS[chat_id] = {}
     if chat_id not in TAKEN:
         TAKEN[chat_id] = set()
-
-async def _save_known(u: User):
-    if u and u.username:
-        KNOWN[u.username.lower()] = u.id
 
 def _cooldown_text(uid: int) -> Optional[str]:
     now = datetime.utcnow()
@@ -167,12 +173,9 @@ def _inc(d: Dict[int, int], key: int, by: int = 1):
 def _make_nick(chat_id: int, prev: Optional[str]) -> str:
     _ensure_chat(chat_id)
     taken = TAKEN[chat_id]
-    for _ in range(50):
+    for _ in range(80):
         parts = []
-        if random.random() < 0.25:
-            parts.append(random.choice(SPICY))
-        else:
-            parts.append(random.choice(ADJ))
+        parts.append(random.choice(SPICY) if random.random() < 0.25 else random.choice(ADJ))
         parts.append(random.choice(NOUN))
         if random.random() < 0.85:
             parts.append(random.choice(TAILS))
@@ -211,7 +214,7 @@ def _resolve_arg_target(context: ContextTypes.DEFAULT_TYPE) -> Optional[int]:
 # ========= КОМАНДЫ =========
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.message:
-        await _save_known(update.effective_user)
+        await _remember_user(update.effective_user)
         await update.message.reply_text(WELCOME_TEXT, reply_markup=main_keyboard())
 
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -227,10 +230,9 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == BTN_HELP:
         await q.message.reply_text(HELP_TEXT, reply_markup=main_keyboard())
     elif data == BTN_STATS:
-        text = build_stats_text(update.effective_chat.id)
-        await q.message.reply_text(text, reply_markup=main_keyboard())
+        await q.message.reply_text(build_stats_text(update.effective_chat.id), reply_markup=main_keyboard())
     elif data == BTN_ACH:
-        await q.message.reply_text("🏅 Ачивки скоро подключим. Пока ловите «Читер ёбаный» за +1 себе 😈",
+        await q.message.reply_text("🏅 Ачивки: «Читер ёбаный» — за попытку +1 себе. Остальные скоро 😉",
                                    reply_markup=main_keyboard())
     else:
         await q.message.reply_text("¯\\_(ツ)_/¯ Неизвестная кнопка", reply_markup=main_keyboard())
@@ -239,7 +241,7 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_nick(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message:
         return
-    await _save_known(update.effective_user)
+    await _remember_user(update.effective_user)
 
     chat_id = update.effective_chat.id
     initiator = update.effective_user
@@ -256,12 +258,13 @@ async def cmd_nick(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if target_user:
         target_id = target_user.id
-        target_name = _user_key(target_user)
-        await _save_known(target_user)
+        target_name = _display_name(target_user)
+        await _remember_user(target_user)
     else:
         by_arg = _resolve_arg_target(context)
         if by_arg:
             target_id = by_arg
+            # восстановим @username из KNOWN
             for uname, uid in KNOWN.items():
                 if uid == by_arg:
                     target_name = f"@{uname}"
@@ -269,7 +272,7 @@ async def cmd_nick(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if target_id is None:
         target_id = initiator.id
-        target_name = _user_key(initiator)
+        target_name = _display_name(initiator)
 
     _ensure_chat(chat_id)
     prev = NICKS[chat_id].get(target_id)
@@ -293,6 +296,7 @@ EIGHT_BALL = [
 async def cmd_8ball(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message:
         return
+    await _remember_user(update.effective_user)
     _inc(EIGHTBALL_COUNT, update.effective_user.id)
     q = " ".join(context.args).strip()
     if not q:
@@ -300,7 +304,9 @@ async def cmd_8ball(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     await update.message.reply_text(random.choice(EIGHT_BALL))
 
-# ---- авто-триггеры + счётчики сообщений ----
+# ---- ЕДИНЫЙ ОБРАБОТЧИК ТЕКСТА: счётчики → репутация → триггеры ----
+REP_CMD = re.compile(r"^[\+\-]1(\b|$)", re.IGNORECASE)
+
 def _trigger_allowed(chat_id: int) -> bool:
     now = datetime.utcnow()
     last = LAST_TRIGGER_TIME.get(chat_id)
@@ -309,22 +315,72 @@ def _trigger_allowed(chat_id: int) -> bool:
     LAST_TRIGGER_TIME[chat_id] = now
     return True
 
-async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.message
     if not msg or msg.from_user is None:
         return
     if msg.from_user.is_bot:
         return
 
-    # счётчики
+    # запомним имя/@username
+    await _remember_user(msg.from_user)
+
+    # === 1) Счётчики активности ===
     uid = msg.from_user.id
     _inc(MSG_COUNT, uid)
     _inc(CHAR_COUNT, uid, by=len(msg.text or ""))
 
-    # триггеры
     text = (msg.text or "").strip()
     if not text:
         return
+
+    # === 2) Репутация (+1/-1) ===
+    if REP_CMD.match(text):
+        is_plus = text.startswith("+")
+        giver = msg.from_user
+        target_user: Optional[User] = None
+        target_id: Optional[int] = None
+        target_name: Optional[str] = None
+
+        if msg.reply_to_message and msg.reply_to_message.from_user:
+            target_user = msg.reply_to_message.from_user
+            target_id = target_user.id
+            target_name = _display_name(target_user)
+            await _remember_user(target_user)
+        else:
+            parts = text.split()
+            if len(parts) >= 2 and parts[1].startswith("@"):
+                uid2 = KNOWN.get(parts[1][1:].lower())
+                if uid2:
+                    target_id = uid2
+                    target_name = parts[1]
+
+        if target_id is None:
+            await msg.reply_text("Кому ставим репу? Ответь на сообщение или укажи @username.")
+            return
+
+        if is_plus and target_id == giver.id:
+            # ачивка за попытку +1 себе
+            if _achieve(giver.id, "Читер ёбаный"):
+                await msg.reply_text("«Читер ёбаный» 🏅 — за попытку +1 себе. Нельзя!")
+            else:
+                await msg.reply_text("Нельзя +1 себе, хорош мухлевать 🐍")
+            return
+
+        delta = 1 if is_plus else -1
+        _inc(REP_RECEIVED, target_id, by=delta)
+        _inc(REP_GIVEN, giver.id, by=delta)
+        if delta > 0:
+            _inc(REP_POS_GIVEN, giver.id)
+        else:
+            _inc(REP_NEG_GIVEN, giver.id)
+
+        total = REP_RECEIVED.get(target_id, 0)
+        sign = "+" if delta > 0 else "-"
+        await msg.reply_text(f"{target_name or 'Пользователь'} получает {sign}1. Текущая репа: {total}")
+        return  # после репы больше ничего не делаем
+
+    # === 3) Триггеры ===
     for pattern, answers in TRIGGERS:
         if pattern.search(text):
             if _trigger_allowed(update.effective_chat.id):
@@ -332,133 +388,32 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 _inc(TRIGGER_HITS, uid)
             break
 
-# ---- РЕПУТАЦИЯ (+1/-1) ----
-REP_CMD = re.compile(r"^[\+\-]1(\b|$)", re.IGNORECASE)
+# ========= СТАТИСТИКА =========
+def _name_or_id(uid: int) -> str:
+    return NAMES.get(uid, f"id{uid}")
 
-def _resolve_target_from_text(context: ContextTypes.DEFAULT_TYPE) -> Optional[int]:
-    # ожидаем +1 @user / -1 @user
-    if not context.args:
-        return None
-    arg = context.args[0]
-    if arg.startswith("@"):
-        return KNOWN.get(arg[1:].lower())
-    return None
-
-async def rep_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    Срабатывает на сообщения вида:
-      - реплаем на сообщение пользователя и пишем: +1  или  -1
-      - просто пишем: +1 @username  или  -1 @username
-    """
-    msg = update.message
-    if not msg or msg.from_user is None:
-        return
-    text = (msg.text or "").strip()
-    if not REP_CMD.match(text):
-        return
-
-    giver = msg.from_user
-    is_plus = text.startswith("+")
-    target_user: Optional[User] = None
-    target_id: Optional[int] = None
-    target_name: Optional[str] = None
-
-    if msg.reply_to_message and msg.reply_to_message.from_user:
-        target_user = msg.reply_to_message.from_user
-        target_id = target_user.id
-        target_name = _user_key(target_user)
-        await _save_known(target_user)
-    else:
-        # попробуем вытащить @username
-        parts = text.split()
-        if len(parts) >= 2 and parts[1].startswith("@"):
-            uid = KNOWN.get(parts[1][1:].lower())
-            if uid:
-                target_id = uid
-                target_name = parts[1]
-
-    # если не нашли цель — пробуем через парсер аргументов (+1 @user)
-    if target_id is None:
-        uid = _resolve_target_from_text(context)
-        if uid:
-            target_id = uid
-            for uname, u in KNOWN.items():
-                if u == uid:
-                    target_name = f"@{uname}"
-                    break
-
-    # если всё ещё нет цели — выходим
-    if target_id is None:
-        await msg.reply_text("Кому ставим репу? Ответь на сообщение или укажи @username.")
-        return
-
-    # запрет на +1 себе
-    if is_plus and target_id == giver.id:
-        if _achieve(giver.id, "Читер ёбаный"):
-            await msg.reply_text("«Читер ёбаный» 🏅 — за попытку +1 себе. Нельзя!")
-        else:
-            await msg.reply_text("Нельзя +1 себе, хорош мухлевать 🐍")
-        return
-
-    # применяем репутацию
-    delta = 1 if is_plus else -1
-    _inc(REP_RECEIVED, target_id, by=delta)
-    _inc(REP_GIVEN, giver.id, by=delta)
-    if delta > 0:
-        _inc(REP_POS_GIVEN, giver.id)
-    else:
-        _inc(REP_NEG_GIVEN, giver.id)
-
-    # ответ
-    sign = "+" if delta > 0 else "-"
-    total = REP_RECEIVED.get(target_id, 0)
-    await msg.reply_text(f"{target_name or 'Пользователь'} получает {sign}1. Текущая репа: {total}")
-
-# ========= ERROR HANDLER =========
-async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        print("ERROR:", context.error)
-    except Exception:
-        pass
-
-# ========= СТАТИСТИКА (текст) =========
 def build_stats_text(chat_id: int) -> str:
-    # топ по полученной репутации (3 места)
+    # Топ по полученной репутации (3 места)
     top = sorted(REP_RECEIVED.items(), key=lambda x: x[1], reverse=True)[:3]
-    top_lines = []
-    for uid, score in top:
-        name = f"id{uid}"
-        # попробуем найти ник или @username
-        nick = None
-        if chat_id in NICKS and uid in NICKS[chat_id]:
-            nick = NICKS[chat_id][uid]
-        if nick:
-            name = f"{name} ({nick})"
-        top_lines.append(f"• {name}: {score}")
+    top_lines = [f"• {_name_or_id(uid)}: {score}" for uid, score in top] or ["• пока пусто"]
 
-    if not top_lines:
-        top_lines = ["• пока пусто"]
+    # Текущие ники для чата
+    nick_items = NICKS.get(chat_id, {})
+    nick_lines = [f"• {_name_or_id(uid)}: {nick}" for uid, nick in nick_items.items()] or ["• пока никому не присвоено"]
 
-    # текущие ники
-    nick_lines = []
-    for uid, nick in NICKS.get(chat_id, {}).items():
-        nick_lines.append(f"• id{uid}: {nick}")
-    if not nick_lines:
-        nick_lines = ["• пока никому не присвоено"]
-
-    # активность
-    # возьмём топ по сообщениям (3 места)
+    # Активность (топ-3 по сообщениям)
     top_msg = sorted(MSG_COUNT.items(), key=lambda x: x[1], reverse=True)[:3]
-    msg_lines = [f"• id{uid}: {cnt} смс / {CHAR_COUNT.get(uid,0)} симв." for uid, cnt in top_msg] or ["• пока пусто"]
+    msg_lines = [f"• {_name_or_id(uid)}: {cnt} смс / {CHAR_COUNT.get(uid,0)} симв."
+                 for uid, cnt in top_msg] or ["• пока пусто"]
 
     return (
-        "📊 Статистика (черновик)\n\n"
-        "🏆 Топ по репутации (полученной):\n" + "\n".join(top_lines) + "\n\n"
+        f"{STATS_TITLE}\n\n"
+        "🏆 Топ по репутации:\n" + "\n".join(top_lines) + "\n\n"
         "📝 Текущие ники:\n" + "\n".join(nick_lines) + "\n\n"
         "⌨️ Активность:\n" + "\n".join(msg_lines)
     )
 
-# ========= HEALTH-СЕРВЕР ДЛЯ RENDER =========
+# ========= HEALTH для Render =========
 app = Flask(__name__)
 @app.get("/")
 def health():
@@ -470,22 +425,18 @@ def run_flask():
 
 # ========= ENTRY =========
 async def _pre_init(app: Application):
-    # На всякий: снести webhook перед polling, чтобы не было конфликтов
+    # на всякий случай удаляем возможный webhook
     try:
         await app.bot.delete_webhook(drop_pending_updates=True)
     except Exception:
         pass
 
 def main():
-    # Render любит, когда порт слушается — поднимем health-сервер
+    # маленький веб-сервер: Render любит, когда кто-то слушает порт
     threading.Thread(target=run_flask, daemon=True).start()
 
-    # Укороченные таймауты для getUpdates (меньше конфликтов на free-инстансе)
-    req = HTTPXRequest(
-        connect_timeout=10.0,
-        read_timeout=25.0,
-        pool_timeout=5.0,
-    )
+    # «тихие» таймауты для polling (меньше конфликтов в логах на free)
+    req = HTTPXRequest(connect_timeout=10.0, read_timeout=25.0, pool_timeout=5.0)
 
     application: Application = (
         ApplicationBuilder()
@@ -497,21 +448,15 @@ def main():
 
     # Команды
     application.add_handler(CommandHandler("start", cmd_start))
-    application.add_handler(CommandHandler("help", cmd_help))
-    application.add_handler(CommandHandler("nick", cmd_nick))
+    application.add_handler(CommandHandler("help",  cmd_help))
+    application.add_handler(CommandHandler("nick",  cmd_nick))
     application.add_handler(CommandHandler("8ball", cmd_8ball))
-
-    # Репутация (+1/-1) — через общий MessageHandler, чтоб работало и по реплаю, и с @username
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, rep_handler))
 
     # Кнопки
     application.add_handler(CallbackQueryHandler(on_button))
 
-    # Сообщения (триггеры и счётчики) — после репы, чтобы не перехватывать команды
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_message))
-
-    # Ошибки
-    application.add_error_handler(on_error)
+    # ЕДИНЫЙ обработчик текстов (не команд)
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
 
     # Запуск polling
     from telegram import Update as TgUpdate
