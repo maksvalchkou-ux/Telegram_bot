@@ -1,7 +1,11 @@
+import os
 import random
-from aiogram import Bot, Dispatcher, executor, types
+import asyncio
+from aiogram import Bot, Dispatcher, types
+from aiohttp import web
 
-API_TOKEN = "ТОКЕН_ТВОЕГО_БОТА"
+# Берём токен из переменных окружения (Render → Environment)
+API_TOKEN = os.getenv("BOT_TOKEN")
 
 bot = Bot(token=API_TOKEN)
 dp = Dispatcher(bot)
@@ -29,15 +33,17 @@ reactions = {
 }
 
 
-# 🎱 8ball
+# 🎱 Magic 8ball
 @dp.message_handler(commands=["8ball"])
 async def magic8ball(message: types.Message):
     await message.reply(random.choice(answers))
+
 
 # 🌀 Генератор никнеймов
 @dp.message_handler(commands=["nick"])
 async def nickname(message: types.Message):
     await message.reply(f"Твой новый ник: {random.choice(nicknames)}")
+
 
 # ⭐ Очки репутации
 @dp.message_handler(lambda m: "+1" in m.text or "-1" in m.text)
@@ -49,6 +55,7 @@ async def reputation_handler(message: types.Message):
         reputation[user] = reputation.get(user, 0) + change
         await message.reply(f"{user} теперь имеет {reputation[user]} очков репутации!")
 
+
 # 🗣️ Реакции на слова
 @dp.message_handler()
 async def reactions_handler(message: types.Message):
@@ -58,5 +65,18 @@ async def reactions_handler(message: types.Message):
             break
 
 
+# ---- Мини веб-сервер для Render ----
+async def handle(request):
+    return web.Response(text="Bot is running!")
+
+async def on_startup(_):
+    asyncio.create_task(dp.start_polling())
+
+def main():
+    app = web.Application()
+    app.router.add_get("/", handle)
+    port = int(os.getenv("PORT", 5000))
+    web.run_app(app, host="0.0.0.0", port=port)
+
 if __name__ == "__main__":
-    executor.start_polling(dp, skip_updates=True)
+    main()
