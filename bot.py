@@ -309,6 +309,50 @@ async def on_poll(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     chat_id, target_id, target_username, pending_nick = ADMIN_NICK_POLLS.pop(poll.id)
+    async def close_admin_poll_job(context: ContextTypes.DEFAULT_TYPE):
+    data = context.job.data
+    poll_id = data["poll_id"]
+    chat_id = data["chat_id"]
+    message_id = data["message_id"]
+
+    # Закрываем опрос и получаем финальные итоги
+    try:
+        closed_poll = await context.bot.stop_poll(chat_id=chat_id, message_id=message_id)
+    except Exception:
+        closed_poll = None
+
+    # Если по какой-то причине не получилось — попробуем добрать из нашей таблицы
+    info = ADMIN_NICK_POLLS.pop(poll_id, None)
+    if not info:
+        return  # уже обработан или не наш
+
+    target_chat_id, target_id, target_username, pending_nick = info
+
+    yes_votes = 0
+    no_votes = 0
+    if closed_poll:
+        for opt in closed_poll.options:
+            if opt.text == "Да":
+                yes_votes = opt.voter_count
+            elif opt.text == "Нет":
+                no_votes = opt.voter_count
+
+    # Если закрытый опрос не вернул данные (редко), просто сравним по наличию
+    passed = yes_votes > no_votes
+
+    if passed:
+        _ensure_chat_maps(target_chat_id)
+        prev = NICKS[target_chat_id].get(target_id)
+        if pending_nick != prev:
+            _set_nick(target_chat_id, target_id, pending_nick)
+        text = f"🎉 Голосование принято! {target_username} теперь «{pending_nick}»"
+    else:
+        text = f"❌ Голосование не прошло. Ник {target_username} остаётся без изменений."
+
+    try:
+        await context.bot.send_message(chat_id=target_chat_id, text=text)
+    except Exception:
+        pass
     # результаты
     yes_votes = 0
     no_votes = 0
