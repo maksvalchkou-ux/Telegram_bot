@@ -3,7 +3,7 @@ import re
 import random
 import threading
 from datetime import datetime, timedelta
-from typing import Dict, Optional, Set
+from typing import Dict, Optional, Set, Tuple
 
 from flask import Flask
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, User
@@ -11,7 +11,7 @@ from telegram.ext import (
     Application, ApplicationBuilder, CommandHandler, CallbackQueryHandler,
     MessageHandler, ContextTypes, filters
 )
-from telegram.request import HTTPXRequest  # тихий polling с таймаутами
+from telegram.request import HTTPXRequest  # «тихий» polling с таймаутами
 
 # ========= НАСТРОЙКИ =========
 API_TOKEN = os.getenv("BOT_TOKEN")
@@ -29,15 +29,17 @@ WELCOME_TEXT = (
     "Жми кнопки ниже, чтобы посмотреть, что я умею, или открыть статистику и ачивки."
 )
 HELP_TEXT = (
-    "🛠 Что умеет этот бот (v3.1):\n"
+    "🛠 Что умеет этот бот (v4 — ачивки):\n"
     "• /start — меню с кнопками\n"
     "• /nick — ник себе; /nick @user или ответом — ник другу (включая админа)\n"
     "• /8ball вопрос — магический шар отвечает\n"
     "• Репутация: +1/-1 по реплаю или +1 @user / -1 @user\n"
     "  (самому себе +1 нельзя — ачивка «Читер ёбаный»)\n"
-    "• Автоответы по ключевым словам (пиво, работа, сон, зал, деньги, привет/пока, любовь)\n"
-    "• Статистика: топ по репутации, текущие ники и активность (смс/символы)\n"
+    "• Автоответы: пиво, работа, сон, зал, деньги, привет/пока, любовь\n"
+    "• «📊 Статистика» — топ репы, текущие ники и активность\n"
+    "• «🏅 Ачивки» — список и твои достижения\n"
 )
+
 STATS_TITLE = "📊 Статистика"
 
 # ========= КНОПКИ =========
@@ -70,8 +72,8 @@ LAST_TRIGGER_TIME: Dict[int, datetime] = {}  # chat_id -> last trigger time
 # — репутация
 REP_GIVEN: Dict[int, int] = {}            # user_id -> суммарно выдал (+/-)
 REP_RECEIVED: Dict[int, int] = {}         # user_id -> суммарно получил
-REP_POS_GIVEN: Dict[int, int] = {}
-REP_NEG_GIVEN: Dict[int, int] = {}
+REP_POS_GIVEN: Dict[int, int] = {}        # user_id -> выдано +1
+REP_NEG_GIVEN: Dict[int, int] = {}        # user_id -> выдано -1
 
 # — счётчики
 MSG_COUNT: Dict[int, int] = {}            # user_id -> сообщений
@@ -79,6 +81,7 @@ CHAR_COUNT: Dict[int, int] = {}           # user_id -> символов
 NICK_CHANGE_COUNT: Dict[int, int] = {}    # user_id -> сколько раз меняли ник
 EIGHTBALL_COUNT: Dict[int, int] = {}      # user_id -> вызовов 8ball
 TRIGGER_HITS: Dict[int, int] = {}         # user_id -> сколько раз триггерил бот
+BEER_HITS: Dict[int, int] = {}            # user_id -> сколько раз словил «пиво»-триггер
 
 # — ачивки
 ACHIEVEMENTS: Dict[int, Set[str]] = {}    # user_id -> set(title)
@@ -89,6 +92,23 @@ def _achieve(user_id: int, title: str) -> bool:
         return False
     got.add(title)
     return True
+
+# ========= АЧИВКИ (название -> (описание, условие-объяснение)) =========
+ACH_LIST: Dict[str, Tuple[str, str]] = {
+    "Читер ёбаный": ("попытка поставить +1 самому себе", "Сам себе +1 — нельзя."),
+    "Никофил ебучий": ("5 смен никнейма", "Сменил ник ≥ 5 раз."),
+    "Щедрый засранец": ("раздал +10 репутаций", "Выдано +1 ≥ 10 раз."),
+    "Любимчик, сука": ("получил +20 репутации", "Получено репы ≥ 20."),
+    "Пивной сомелье-алкаш": ("5 раз триггерил «пиво»", "Слово «пиво/пивко…» ≥ 5."),
+    "Шароман долбанный": ("10 обращений к /8ball", "Вызовов /8ball ≥ 10."),
+}
+
+# Пороги
+TH_NICKOFIL = 5
+TH_GIVER    = 10
+TH_LOVED    = 20
+TH_BEER     = 5
+TH_BALL     = 10
 
 # ========= СЛОВАРИ ДЛЯ НИКОВ =========
 ADJ = [
@@ -114,6 +134,7 @@ SPICY = [
 ]
 
 # ========= ТРИГГЕРЫ =========
+# индекс 1 — «пиво», чтобы отдельно считать BEER_HITS
 TRIGGERS = [
     (re.compile(r"\bработ(а|ать|аю|аем|ает|ал|али|ать|у|ы|е|ой)\b", re.IGNORECASE),
      ["Работка подъехала? Держись, чемпион 🛠️",
@@ -211,6 +232,17 @@ def _resolve_arg_target(context: ContextTypes.DEFAULT_TYPE) -> Optional[int]:
         return KNOWN.get(arg[1:].lower())
     return None
 
+async def _announce_achievement(context: ContextTypes.DEFAULT_TYPE, chat_id: int, user_id: int, title: str):
+    name = NAMES.get(user_id, f"id{user_id}")
+    desc = ACH_LIST.get(title, ("", ""))[0]
+    try:
+        await context.bot.send_message(chat_id, f"🏅 {name} получает ачивку: **{title}** — {desc}", parse_mode="Markdown")
+    except Exception:
+        pass
+
+def _name_or_id(uid: int) -> str:
+    return NAMES.get(uid, f"id{uid}")
+
 # ========= КОМАНДЫ =========
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.message:
@@ -232,8 +264,8 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == BTN_STATS:
         await q.message.reply_text(build_stats_text(update.effective_chat.id), reply_markup=main_keyboard())
     elif data == BTN_ACH:
-        await q.message.reply_text("🏅 Ачивки: «Читер ёбаный» — за попытку +1 себе. Остальные скоро 😉",
-                                   reply_markup=main_keyboard())
+        uid = q.from_user.id if q.from_user else None
+        await q.message.reply_text(build_achievements_text(uid), reply_markup=main_keyboard(), parse_mode="Markdown")
     else:
         await q.message.reply_text("¯\\_(ツ)_/¯ Неизвестная кнопка", reply_markup=main_keyboard())
 
@@ -264,7 +296,6 @@ async def cmd_nick(update: Update, context: ContextTypes.DEFAULT_TYPE):
         by_arg = _resolve_arg_target(context)
         if by_arg:
             target_id = by_arg
-            # восстановим @username из KNOWN
             for uname, uid in KNOWN.items():
                 if uid == by_arg:
                     target_name = f"@{uname}"
@@ -279,6 +310,11 @@ async def cmd_nick(update: Update, context: ContextTypes.DEFAULT_TYPE):
     new_nick = _make_nick(chat_id, prev)
     _apply_nick(chat_id, target_id, new_nick)
     _mark_nick(initiator.id)
+
+    # ачивка «Никофил ебучий»
+    if NICK_CHANGE_COUNT.get(target_id, 0) >= TH_NICKOFIL:
+        if _achieve(target_id, "Никофил ебучий"):
+            await _announce_achievement(context, chat_id, target_id, "Никофил ебучий")
 
     if target_id == initiator.id:
         await update.message.reply_text(f"Твой новый ник: «{new_nick}»")
@@ -297,7 +333,13 @@ async def cmd_8ball(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message:
         return
     await _remember_user(update.effective_user)
-    _inc(EIGHTBALL_COUNT, update.effective_user.id)
+    uid = update.effective_user.id
+    _inc(EIGHTBALL_COUNT, uid)
+    # ачивка «Шароман долбанный»
+    if EIGHTBALL_COUNT.get(uid, 0) >= TH_BALL:
+        if _achieve(uid, "Шароман долбанный"):
+            await _announce_achievement(context, update.effective_chat.id, uid, "Шароман долбанный")
+
     q = " ".join(context.args).strip()
     if not q:
         await update.message.reply_text("Задай вопрос: `/8ball стоит ли идти за пивом?`", parse_mode="Markdown")
@@ -372,8 +414,17 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         _inc(REP_GIVEN, giver.id, by=delta)
         if delta > 0:
             _inc(REP_POS_GIVEN, giver.id)
+            # ачивка «Щедрый засранец»
+            if REP_POS_GIVEN.get(giver.id, 0) >= TH_GIVER:
+                if _achieve(giver.id, "Щедрый засранец"):
+                    await _announce_achievement(context, update.effective_chat.id, giver.id, "Щедрый засранец")
         else:
             _inc(REP_NEG_GIVEN, giver.id)
+
+        # ачивка «Любимчик, сука»
+        if REP_RECEIVED.get(target_id, 0) >= TH_LOVED:
+            if _achieve(target_id, "Любимчик, сука"):
+                await _announce_achievement(context, update.effective_chat.id, target_id, "Любимчик, сука")
 
         total = REP_RECEIVED.get(target_id, 0)
         sign = "+" if delta > 0 else "-"
@@ -381,17 +432,19 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return  # после репы больше ничего не делаем
 
     # === 3) Триггеры ===
-    for pattern, answers in TRIGGERS:
+    for idx, (pattern, answers) in enumerate(TRIGGERS):
         if pattern.search(text):
             if _trigger_allowed(update.effective_chat.id):
                 await msg.reply_text(random.choice(answers))
                 _inc(TRIGGER_HITS, uid)
+                if idx == 1:  # «пиво»-триггер
+                    _inc(BEER_HITS, uid)
+                    if BEER_HITS.get(uid, 0) >= TH_BEER:
+                        if _achieve(uid, "Пивной сомелье-алкаш"):
+                            await _announce_achievement(context, update.effective_chat.id, uid, "Пивной сомелье-алкаш")
             break
 
 # ========= СТАТИСТИКА =========
-def _name_or_id(uid: int) -> str:
-    return NAMES.get(uid, f"id{uid}")
-
 def build_stats_text(chat_id: int) -> str:
     # Топ по полученной репутации (3 места)
     top = sorted(REP_RECEIVED.items(), key=lambda x: x[1], reverse=True)[:3]
@@ -413,6 +466,14 @@ def build_stats_text(chat_id: int) -> str:
         "⌨️ Активность:\n" + "\n".join(msg_lines)
     )
 
+def build_achievements_text(user_id: Optional[int]) -> str:
+    lines = ["🏅 Ачивки — список и твои галочки:\n"]
+    got = ACHIEVEMENTS.get(user_id or -1, set())
+    for title, (desc, cond) in ACH_LIST.items():
+        mark = "✅" if title in got else "▫️"
+        lines.append(f"{mark} *{title}* — {desc} _(условие: {cond})_")
+    return "\n".join(lines)
+
 # ========= HEALTH для Render =========
 app = Flask(__name__)
 @app.get("/")
@@ -425,7 +486,7 @@ def run_flask():
 
 # ========= ENTRY =========
 async def _pre_init(app: Application):
-    # на всякий случай удаляем возможный webhook
+    # на всякий: удаляем возможный webhook
     try:
         await app.bot.delete_webhook(drop_pending_updates=True)
     except Exception:
