@@ -7,23 +7,17 @@ from telegram import (
     Update, InlineKeyboardButton, InlineKeyboardMarkup, User, Poll
 )
 from telegram.ext import (
-    Application, CommandHandler, CallbackQueryHandler, ContextTypes, PollHandler
+    Application, ApplicationBuilder, CommandHandler, CallbackQueryHandler,
+    ContextTypes, PollHandler
 )
+from telegram.error import TimedOut
 
 # ========= НАСТРОЙКИ =========
 API_TOKEN = os.getenv("BOT_TOKEN")
 if not API_TOKEN:
     raise RuntimeError("BOT_TOKEN is not set")
 
-# Render даёт публичный URL в переменной окружения
-PUBLIC_URL = os.getenv("RENDER_EXTERNAL_URL") or os.getenv("PUBLIC_URL")
-if not PUBLIC_URL:
-    # Можно также прописать PUBLIC_URL вручную в Environment, если что
-    raise RuntimeError("RENDER_EXTERNAL_URL (или PUBLIC_URL) is not set")
-
-PORT = int(os.getenv("PORT", 5000))
-
-# >>> ДЛЯ ТЕСТА: 10 секунд. Потом верните на hours=1 <<<
+# >>> ДЛЯ ТЕСТА: 10 секунд. Потом верни на hours=1 <<<
 NICK_COOLDOWN = timedelta(seconds=10)
 
 # ========= ТЕКСТЫ =========
@@ -33,7 +27,7 @@ WELCOME_TEXT = (
 )
 
 HELP_TEXT = (
-    "🛠 Что умеет этот бот (v1 + ники):\n"
+    "🛠 Что умеет этот бот (v1 + ники, polling mode):\n"
     "• /start — меню с кнопками\n"
     "• /nick — сгенерировать ник себе\n"
     "• /nick @user или ответом — сгенерировать ник другу\n"
@@ -324,8 +318,11 @@ async def close_admin_poll_job(context: ContextTypes.DEFAULT_TYPE):
     if message_id:
         try:
             closed_poll = await context.bot.stop_poll(chat_id=chat_id, message_id=message_id)
+        except TimedOut:
+            # сеть подвисла — не падаем, просто не получим финальные цифры
+            closed_poll = None
         except Exception:
-            pass
+            closed_poll = None
 
     info = ADMIN_NICK_POLLS.pop(poll_id, None)
     POLL_MSG_ID.pop(poll_id, None)
@@ -411,37 +408,46 @@ async def cmd_pollclose(update: Update, context: ContextTypes.DEFAULT_TYPE):
         _ensure_chat_maps(target_chat_id)
         prev = NICKS[target_chat_id].get(target_id)
         if pending_nick != prev:
-            _set_nick(chat_id=target_chat_id, user_id=target_id, nick=pending_nick)
+            _set_nick(target_chat_id, target_id, pending_nick)
         result = f"🎉 Голосование принято! {target_username} теперь «{pending_nick}»"
     else:
         result = f"❌ Голосование не прошло. Ник {target_username} остаётся без изменений."
 
     await context.bot.send_message(chat_id=target_chat_id, text=result)
 
-# ========= ENTRY =========
+# ========= ENTRY (polling, без конфликта) =========
+async def _pre_init(app: Application):
+    # ВАЖНО: снести возможный старый вебхук, чтобы polling не конфликтовал
+    try:
+        await app.bot.delete_webhook(drop_pending_updates=True)
+    except Exception:
+        pass
+
 def main():
-    app = Application.builder().token(API_TOKEN).build()
+    application: Application = (
+        ApplicationBuilder()
+        .token(API_TOKEN)
+        .post_init(_pre_init)   # удаляем вебхук перед стартом
+        .build()
+    )
 
-    # команды
-    app.add_handler(CommandHandler("start", cmd_start))
-    app.add_handler(CommandHandler("help", cmd_help))
-    app.add_handler(CommandHandler("nick", cmd_nick))
-    app.add_handler(CommandHandler("pollclose", cmd_pollclose))
+    # Команды
+    application.add_handler(CommandHandler("start", cmd_start))
+    application.add_handler(CommandHandler("help", cmd_help))
+    application.add_handler(CommandHandler("nick", cmd_nick))
+    application.add_handler(CommandHandler("pollclose", cmd_pollclose))
 
-    # кнопки
-    app.add_handler(CallbackQueryHandler(on_button))
+    # Кнопки
+    application.add_handler(CallbackQueryHandler(on_button))
 
-    # события опросов
-    app.add_handler(PollHandler(on_poll))
+    # Голосования
+    application.add_handler(PollHandler(on_poll))
 
-    # Запуск ВЕБХУКАМИ — ни одного getUpdates не будет
-    app.run_webhook(
-        listen="0.0.0.0",
-        port=PORT,
-        url_path=API_TOKEN,  # секретный путь
-        webhook_url=f"{PUBLIC_URL}/{API_TOKEN}",
-        allowed_updates=["message", "callback_query", "poll", "poll_answer"],
-        drop_pending_updates=True,
+    # Разрешим все типы апдейтов, чтобы точно ловить poll/poll_answer
+    from telegram import Update as TgUpdate
+    application.run_polling(
+        allowed_updates=TgUpdate.ALL_TYPES,
+        close_loop=False,
     )
 
 if __name__ == "__main__":
