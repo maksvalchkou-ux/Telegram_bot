@@ -1,11 +1,11 @@
 import os
 import random
+import threading
 from datetime import datetime, timedelta
 from typing import Dict, Tuple, Optional
 
-from telegram import (
-    Update, InlineKeyboardButton, InlineKeyboardMarkup, User, Poll
-)
+from flask import Flask
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, User, Poll
 from telegram.ext import (
     Application, ApplicationBuilder, CommandHandler, CallbackQueryHandler,
     ContextTypes, PollHandler
@@ -33,7 +33,7 @@ HELP_TEXT = (
     "• /nick @user или ответом — сгенерировать ник другу\n"
     "• Если цель — админ: запускаем голосование (2 минуты)\n"
     "• Лимит для инициатора: сейчас 10 сек (для теста), антиповторы\n\n"
-    "Дальше добавим репутацию, 8ball, триггеры, статистику и ачивки."
+    "Скоро добавим репутацию, 8ball, триггеры, статистику и ачивки."
 )
 
 STATS_PLACEHOLDER = (
@@ -66,13 +66,13 @@ def main_keyboard() -> InlineKeyboardMarkup:
     ]
     return InlineKeyboardMarkup(keyboard)
 
-# ========= ПАМЯТЬ =========
-NICKS: Dict[int, Dict[int, str]] = {}
-TAKEN_NICKS: Dict[int, set] = {}
-LAST_NICK_ACTION: Dict[int, datetime] = {}
-KNOWN_USERS: Dict[str, int] = {}
-ADMIN_NICK_POLLS: Dict[str, Tuple[int, int, str, str]] = {}
-POLL_MSG_ID: Dict[str, int] = {}
+# ========= ПАМЯТЬ (in-memory) =========
+NICKS: Dict[int, Dict[int, str]] = {}                         # chat_id -> { user_id: nick }
+TAKEN_NICKS: Dict[int, set] = {}                               # chat_id -> set(nick)
+LAST_NICK_ACTION: Dict[int, datetime] = {}                     # initiator_id -> last time
+KNOWN_USERS: Dict[str, int] = {}                               # username_lower -> user_id
+ADMIN_NICK_POLLS: Dict[str, Tuple[int, int, str, str]] = {}    # poll_id -> (chat_id, target_id, @name, nick)
+POLL_MSG_ID: Dict[str, int] = {}                               # poll_id -> message_id
 
 # ========= СЛОВАРИ ДЛЯ НИКОВ =========
 ADJ = [
@@ -176,7 +176,7 @@ async def _update_known_user(user: User):
     if user and user.username:
         KNOWN_USERS[user.username.lower()] = user.id
 
-# ========= КОМАНДЫ И КНОПКИ =========
+# ========= КОМАНДЫ/КНОПКИ =========
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.message:
         await _update_known_user(update.effective_user)
@@ -215,6 +215,7 @@ async def cmd_nick(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"Потерпи, {cd}")
         return
 
+    # цель: reply > @username > сам себе
     target_user = _resolve_target_user(update)
     target_id: Optional[int] = None
     target_username: Optional[str] = None
@@ -236,6 +237,7 @@ async def cmd_nick(update: Update, context: ContextTypes.DEFAULT_TYPE):
         target_id = initiator.id
         target_username = _user_key(initiator)
 
+    # если цель — админ и это не сам себе: запускаем голосование
     is_target_admin = await _is_admin(chat_id, target_id, context)
     if is_target_admin and target_id != initiator.id:
         _ensure_chat_maps(chat_id)
@@ -246,16 +248,16 @@ async def cmd_nick(update: Update, context: ContextTypes.DEFAULT_TYPE):
             question=f"Меняем ник админу {target_username} на «{new_nick}»?",
             options=["Да", "Нет"],
             is_anonymous=False,
-            open_period=120,  # Телеграм сам закроет через 2 минуты
+            open_period=120,  # Телеграм закроет сам через 2 минуты
         )
 
         ADMIN_NICK_POLLS[poll_msg.poll.id] = (chat_id, target_id, target_username, new_nick)
         POLL_MSG_ID[poll_msg.poll.id] = poll_msg.message_id
 
-        # Резерв: если апдейт не придёт — сами закроем и подведём итог
-        context.job_queue.run_once(
+        # РЕЗЕРВ: через 125 сек сами закроем и подведём итог
+        context.application.job_queue.run_once(
             close_admin_poll_job,
-            when=125,
+            when=125,  # для теста можно 25
             data={"poll_id": poll_msg.poll.id, "chat_id": chat_id, "message_id": poll_msg.message_id},
             name=f"closepoll:{poll_msg.poll.id}",
         )
@@ -263,6 +265,7 @@ async def cmd_nick(update: Update, context: ContextTypes.DEFAULT_TYPE):
         _mark_cooldown(initiator.id)
         return
 
+    # обычный случай: применяем ник сразу
     _ensure_chat_maps(chat_id)
     prev = NICKS[chat_id].get(target_id)
     new_nick = _make_nick(chat_id, prev)
@@ -274,7 +277,7 @@ async def cmd_nick(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await update.message.reply_text(f"{target_username} теперь известен(а) как «{new_nick}»")
 
-# ---- автособытие закрытого опроса (резерв) ----
+# ---- обработчик закрытого опроса от Telegram ----
 async def on_poll(update: Update, context: ContextTypes.DEFAULT_TYPE):
     poll: Poll = update.poll
     if poll.id not in ADMIN_NICK_POLLS:
@@ -319,7 +322,6 @@ async def close_admin_poll_job(context: ContextTypes.DEFAULT_TYPE):
         try:
             closed_poll = await context.bot.stop_poll(chat_id=chat_id, message_id=message_id)
         except TimedOut:
-            # сеть подвисла — не падаем, просто не получим финальные цифры
             closed_poll = None
         except Exception:
             closed_poll = None
@@ -340,9 +342,7 @@ async def close_admin_poll_job(context: ContextTypes.DEFAULT_TYPE):
             elif opt.text == "Нет":
                 no_votes = opt.voter_count
 
-    passed = yes_votes > no_votes
-
-    if passed:
+    if yes_votes > no_votes:
         _ensure_chat_maps(target_chat_id)
         prev = NICKS[target_chat_id].get(target_id)
         if pending_nick != prev:
@@ -356,7 +356,7 @@ async def close_admin_poll_job(context: ContextTypes.DEFAULT_TYPE):
     except Exception:
         pass
 
-# ---- команда для админа: форс-закрыть активный опрос ----
+# ---- команда: форс-закрыть активный опрос ----
 async def cmd_pollclose(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message:
         return
@@ -415,19 +415,39 @@ async def cmd_pollclose(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await context.bot.send_message(chat_id=target_chat_id, text=result)
 
-# ========= ENTRY (polling, без конфликта) =========
+# ---- error handler (чтоб не падал поток) ----
+async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        print("ERROR:", context.error)
+    except Exception:
+        pass
+
+# ========= МАЛЕНЬКИЙ ВЕБ-СЕРВЕР ДЛЯ RENDER =========
+app = Flask(__name__)
+@app.get("/")
+def health():
+    return "Bot is running!"
+
+def run_flask():
+    port = int(os.getenv("PORT", 5000))
+    app.run(host="0.0.0.0", port=port)
+
+# ========= ENTRY =========
 async def _pre_init(app: Application):
-    # ВАЖНО: снести возможный старый вебхук, чтобы polling не конфликтовал
+    # ВАЖНО: снести webhook, если он был, чтобы polling не конфликтовал
     try:
         await app.bot.delete_webhook(drop_pending_updates=True)
     except Exception:
         pass
 
 def main():
+    # Поднимем health-сервер в фоне (Render любит, когда порт слушается)
+    threading.Thread(target=run_flask, daemon=True).start()
+
     application: Application = (
         ApplicationBuilder()
         .token(API_TOKEN)
-        .post_init(_pre_init)   # удаляем вебхук перед стартом
+        .post_init(_pre_init)
         .build()
     )
 
@@ -443,10 +463,14 @@ def main():
     # Голосования
     application.add_handler(PollHandler(on_poll))
 
-    # Разрешим все типы апдейтов, чтобы точно ловить poll/poll_answer
+    # Ошибки
+    application.add_error_handler(on_error)
+
+    # Принимаем все типы апдейтов
     from telegram import Update as TgUpdate
     application.run_polling(
         allowed_updates=TgUpdate.ALL_TYPES,
+        drop_pending_updates=True,
         close_loop=False,
     )
 
