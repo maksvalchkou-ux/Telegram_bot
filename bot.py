@@ -3,7 +3,7 @@ import re
 import random
 import threading
 from datetime import datetime, timedelta
-from typing import Dict, Optional
+from typing import Dict, Optional, Set, Tuple
 
 from flask import Flask
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, User
@@ -31,24 +31,17 @@ WELCOME_TEXT = (
 )
 
 HELP_TEXT = (
-    "🛠 Что умеет этот бот (v2: ники + триггеры + 8ball, polling):\n"
+    "🛠 Что умеет этот бот (v3: ники + триггеры + 8ball + репутация):\n"
     "• /start — меню с кнопками\n"
     "• /nick — сгенерировать ник себе\n"
-    "• /nick @user или ответом — сгенерировать ник другу (включая админа)\n"
-    "• /8ball вопрос — магический шар отвечает рандомно\n"
-    "• Автоответы на ключевые слова (работа, пиво, сон, зал, деньги, привет/пока и др.)\n"
-    "• Антиповторы и кулдауны, чтобы не спамил\n\n"
-    "Дальше добавим репутацию, статистику и ачивки."
+    "• /nick @user или ответом — ник другу (включая админа)\n"
+    "• /8ball вопрос — магический шар отвечает\n"
+    "• Репутация: +1/-1 по реплаю или +1 @user / -1 @user\n"
+    "  (самому себе +1 нельзя — получишь ачивку «Читер ёбаный»)\n"
+    "• Автоответы на ключевые слова (работа, пиво, сон, зал, деньги, привет/пока, любовь)\n"
+    "• Антиповторы и кулдауны\n\n"
+    "Сoon: расширенная статистика и ачивки."
 )
-
-STATS_PLACEHOLDER = (
-    "📊 Статистика (заглушка v1):\n"
-    "• Текущие ники: скоро\n"
-    "• Счётчики сообщений/символов: скоро\n"
-    "• Репутация и ачивки: скоро"
-)
-
-ACHIEVEMENTS_PLACEHOLDER = "🏅 Список ачивок (заглушка v1)."
 
 # ========= КНОПКИ =========
 BTN_HELP = "help_info"
@@ -66,12 +59,37 @@ def main_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(keyboard)
 
 # ========= ПАМЯТЬ (in-memory) =========
-NICKS: Dict[int, Dict[int, str]] = {}   # chat_id -> { user_id: nick }
-TAKEN: Dict[int, set] = {}              # chat_id -> set(nick)
-LAST_NICK: Dict[int, datetime] = {}     # initiator_id -> last nick time
-KNOWN: Dict[str, int] = {}              # username_lower -> user_id
+# ники
+NICKS: Dict[int, Dict[int, str]] = {}           # chat_id -> { user_id: nick }
+TAKEN: Dict[int, Set[str]] = {}                 # chat_id -> set(nick)
+LAST_NICK: Dict[int, datetime] = {}             # initiator_id -> last nick time
+KNOWN: Dict[str, int] = {}                      # username_lower -> user_id
 
-LAST_TRIGGER_TIME: Dict[int, datetime] = {}   # chat_id -> last trigger response time
+# триггеры
+LAST_TRIGGER_TIME: Dict[int, datetime] = {}     # chat_id -> last trigger response time
+
+# репутация
+REP_GIVEN: Dict[int, int] = {}                  # user_id -> сколько выдал (+1/-1 суммарно)
+REP_RECEIVED: Dict[int, int] = {}               # user_id -> сколько получил
+REP_POS_GIVEN: Dict[int, int] = {}              # user_id -> выдано +1
+REP_NEG_GIVEN: Dict[int, int] = {}              # user_id -> выдано -1
+
+# счётчики
+MSG_COUNT: Dict[int, int] = {}                  # user_id -> сообщений
+CHAR_COUNT: Dict[int, int] = {}                 # user_id -> символов
+NICK_CHANGE_COUNT: Dict[int, int] = {}          # user_id -> сколько раз меняли ник
+EIGHTBALL_COUNT: Dict[int, int] = {}            # user_id -> вызовов 8ball
+TRIGGER_HITS: Dict[int, int] = {}               # user_id -> сколько раз триггерил бот
+
+# ачивки
+ACHIEVEMENTS: Dict[int, Set[str]] = {}          # user_id -> set(title)
+
+def _achieve(user_id: int, title: str) -> bool:
+    s = ACHIEVEMENTS.setdefault(user_id, set())
+    if title in s:
+        return False
+    s.add(title)
+    return True
 
 # ========= СЛОВАРИ ДЛЯ НИКОВ =========
 ADJ = [
@@ -97,64 +115,25 @@ SPICY = [
 ]
 
 # ========= ТРИГГЕРЫ =========
-# Небольшие регэкспы, чтобы ловить простые словоформы.
 TRIGGERS = [
-    # работа
     (re.compile(r"\bработ(а|ать|аю|аем|ает|ал|али|ать|у|ы|е|ой)\b", re.IGNORECASE),
-     [
-         "Работка подъехала? Держись, чемпион 🛠️",
-         "Опять работать? Забирай +100 к терпению 💪",
-         "Трудяга на связи. После — пивко заслужено 🍺",
-     ]),
-    # пиво
+     ["Работка подъехала? Держись, чемпион 🛠️",
+      "Опять работать? Забирай +100 к терпению 💪",
+      "Трудяга на связи. После — пивко заслужено 🍺"]),
     (re.compile(r"\bпив(о|ос|ко|анд|андос)\b", re.IGNORECASE),
-     [
-         "За холодненькое! 🍻",
-         "Пенная пауза — святое дело 🍺",
-         "Пивко — и всё наладится 😌",
-     ]),
-    # сон
+     ["За холодненькое! 🍻","Пенная пауза — святое дело 🍺","Пивко — и всё наладится 😌"]),
     (re.compile(r"\bспат|сон|засып|дрыхн|высп(а|ы)", re.IGNORECASE),
-     [
-         "Не забудь поставить будильник ⏰",
-         "Сладких снов, котики 😴",
-         "Дрыхнуть — это тоже хобби.",
-     ]),
-    # зал/спорт
+     ["Не забудь поставить будильник ⏰","Сладких снов, котики 😴","Дрыхнуть — это тоже хобби."]),
     (re.compile(r"\bзал\b|\bкач|трен(ир|ер|ирую|ировка)", re.IGNORECASE),
-     [
-         "Железо не ждёт! 🏋️",
-         "Бицепс сам себя не накачает 💪",
-         "После зала — протеин и мемасы.",
-     ]),
-    # деньги
+     ["Железо не ждёт! 🏋️","Бицепс сам себя не накачает 💪","После зала — протеин и мемасы."]),
     (re.compile(r"\bденьг|бабк|зарплат|зп\b|\bкэш\b", re.IGNORECASE),
-     [
-         "Деньги — пыль. Но приятно, когда их много 💸",
-         "Сколько не зарабатывай — на шаурму всё равно хватит 😎",
-         "Финансовый поток уже в пути 🪄",
-     ]),
-    # привет/здравствуйте
+     ["Деньги — пыль. Но приятно, когда их много 💸","На шаурму хватит — жизнь удалась 😎","Финансовый поток уже в пути 🪄"]),
     (re.compile(r"\bприв(ет|ед)|здоро|здравст", re.IGNORECASE),
-     [
-         "Приветули 👋",
-         "Здарова, легенды!",
-         "Йо-йо, чат!",
-     ]),
-    # пока
+     ["Приветули 👋","Здарова, легенды!","Йо-йо, чат!"]),
     (re.compile(r"\bпок(а|ед)|до встреч|бб\b", re.IGNORECASE),
-     [
-         "Не пропадай 👋",
-         "До связи!",
-         "Ушёл красиво 🚪",
-     ]),
-    # любовь/романтика
+     ["Не пропадай 👋","До связи!","Ушёл красиво 🚪"]),
     (re.compile(r"\bлюбл(ю|юлю)|краш|сердечк|романтик", re.IGNORECASE),
-     [
-         "Любовь спасёт мир ❤️",
-         "Сердечки полетели 💘",
-         "Осторожно, милота выше нормы 🫶",
-     ]),
+     ["Любовь спасёт мир ❤️","Сердечки полетели 💘","Осторожно, милота выше нормы 🫶"]),
 ]
 
 # ========= УТИЛИТЫ =========
@@ -181,6 +160,9 @@ def _cooldown_text(uid: int) -> Optional[str]:
 
 def _mark_nick(uid: int):
     LAST_NICK[uid] = datetime.utcnow()
+
+def _inc(d: Dict[int, int], key: int, by: int = 1):
+    d[key] = d.get(key, 0) + by
 
 def _make_nick(chat_id: int, prev: Optional[str]) -> str:
     _ensure_chat(chat_id)
@@ -211,6 +193,7 @@ def _apply_nick(chat_id: int, user_id: int, new_nick: str):
         TAKEN[chat_id].discard(prev)
     NICKS[chat_id][user_id] = new_nick
     TAKEN[chat_id].add(new_nick)
+    _inc(NICK_CHANGE_COUNT, user_id)
 
 def _resolve_reply_target(update: Update) -> Optional[User]:
     if update.message and update.message.reply_to_message:
@@ -244,9 +227,11 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == BTN_HELP:
         await q.message.reply_text(HELP_TEXT, reply_markup=main_keyboard())
     elif data == BTN_STATS:
-        await q.message.reply_text(STATS_PLACEHOLDER, reply_markup=main_keyboard())
+        text = build_stats_text(update.effective_chat.id)
+        await q.message.reply_text(text, reply_markup=main_keyboard())
     elif data == BTN_ACH:
-        await q.message.reply_text(ACHIEВEMENTS_PLACEHOLDER, reply_markup=main_keyboard())
+        await q.message.reply_text("🏅 Ачивки скоро подключим. Пока ловите «Читер ёбаный» за +1 себе 😈",
+                                   reply_markup=main_keyboard())
     else:
         await q.message.reply_text("¯\\_(ツ)_/¯ Неизвестная кнопка", reply_markup=main_keyboard())
 
@@ -308,13 +293,14 @@ EIGHT_BALL = [
 async def cmd_8ball(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message:
         return
+    _inc(EIGHTBALL_COUNT, update.effective_user.id)
     q = " ".join(context.args).strip()
     if not q:
         await update.message.reply_text("Задай вопрос: `/8ball стоит ли идти за пивом?`", parse_mode="Markdown")
         return
     await update.message.reply_text(random.choice(EIGHT_BALL))
 
-# ---- авто-триггеры ----
+# ---- авто-триггеры + счётчики сообщений ----
 def _trigger_allowed(chat_id: int) -> bool:
     now = datetime.utcnow()
     last = LAST_TRIGGER_TIME.get(chat_id)
@@ -325,18 +311,108 @@ def _trigger_allowed(chat_id: int) -> bool:
 
 async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.message
-    if not msg or not msg.text:
+    if not msg or msg.from_user is None:
         return
-    # не отвечаем на своих
-    if msg.from_user and msg.from_user.is_bot:
+    if msg.from_user.is_bot:
         return
 
-    text = msg.text.strip()
+    # счётчики
+    uid = msg.from_user.id
+    _inc(MSG_COUNT, uid)
+    _inc(CHAR_COUNT, uid, by=len(msg.text or ""))
+
+    # триггеры
+    text = (msg.text or "").strip()
+    if not text:
+        return
     for pattern, answers in TRIGGERS:
         if pattern.search(text):
             if _trigger_allowed(update.effective_chat.id):
                 await msg.reply_text(random.choice(answers))
+                _inc(TRIGGER_HITS, uid)
             break
+
+# ---- РЕПУТАЦИЯ (+1/-1) ----
+REP_CMD = re.compile(r"^[\+\-]1(\b|$)", re.IGNORECASE)
+
+def _resolve_target_from_text(context: ContextTypes.DEFAULT_TYPE) -> Optional[int]:
+    # ожидаем +1 @user / -1 @user
+    if not context.args:
+        return None
+    arg = context.args[0]
+    if arg.startswith("@"):
+        return KNOWN.get(arg[1:].lower())
+    return None
+
+async def rep_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Срабатывает на сообщения вида:
+      - реплаем на сообщение пользователя и пишем: +1  или  -1
+      - просто пишем: +1 @username  или  -1 @username
+    """
+    msg = update.message
+    if not msg or msg.from_user is None:
+        return
+    text = (msg.text or "").strip()
+    if not REP_CMD.match(text):
+        return
+
+    giver = msg.from_user
+    is_plus = text.startswith("+")
+    target_user: Optional[User] = None
+    target_id: Optional[int] = None
+    target_name: Optional[str] = None
+
+    if msg.reply_to_message and msg.reply_to_message.from_user:
+        target_user = msg.reply_to_message.from_user
+        target_id = target_user.id
+        target_name = _user_key(target_user)
+        await _save_known(target_user)
+    else:
+        # попробуем вытащить @username
+        parts = text.split()
+        if len(parts) >= 2 and parts[1].startswith("@"):
+            uid = KNOWN.get(parts[1][1:].lower())
+            if uid:
+                target_id = uid
+                target_name = parts[1]
+
+    # если не нашли цель — пробуем через парсер аргументов (+1 @user)
+    if target_id is None:
+        uid = _resolve_target_from_text(context)
+        if uid:
+            target_id = uid
+            for uname, u in KNOWN.items():
+                if u == uid:
+                    target_name = f"@{uname}"
+                    break
+
+    # если всё ещё нет цели — выходим
+    if target_id is None:
+        await msg.reply_text("Кому ставим репу? Ответь на сообщение или укажи @username.")
+        return
+
+    # запрет на +1 себе
+    if is_plus and target_id == giver.id:
+        if _achieve(giver.id, "Читер ёбаный"):
+            await msg.reply_text("«Читер ёбаный» 🏅 — за попытку +1 себе. Нельзя!")
+        else:
+            await msg.reply_text("Нельзя +1 себе, хорош мухлевать 🐍")
+        return
+
+    # применяем репутацию
+    delta = 1 if is_plus else -1
+    _inc(REP_RECEIVED, target_id, by=delta)
+    _inc(REP_GIVEN, giver.id, by=delta)
+    if delta > 0:
+        _inc(REP_POS_GIVEN, giver.id)
+    else:
+        _inc(REP_NEG_GIVEN, giver.id)
+
+    # ответ
+    sign = "+" if delta > 0 else "-"
+    total = REP_RECEIVED.get(target_id, 0)
+    await msg.reply_text(f"{target_name or 'Пользователь'} получает {sign}1. Текущая репа: {total}")
 
 # ========= ERROR HANDLER =========
 async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
@@ -344,6 +420,43 @@ async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
         print("ERROR:", context.error)
     except Exception:
         pass
+
+# ========= СТАТИСТИКА (текст) =========
+def build_stats_text(chat_id: int) -> str:
+    # топ по полученной репутации (3 места)
+    top = sorted(REP_RECEIVED.items(), key=lambda x: x[1], reverse=True)[:3]
+    top_lines = []
+    for uid, score in top:
+        name = f"id{uid}"
+        # попробуем найти ник или @username
+        nick = None
+        if chat_id in NICKS and uid in NICKS[chat_id]:
+            nick = NICKS[chat_id][uid]
+        if nick:
+            name = f"{name} ({nick})"
+        top_lines.append(f"• {name}: {score}")
+
+    if not top_lines:
+        top_lines = ["• пока пусто"]
+
+    # текущие ники
+    nick_lines = []
+    for uid, nick in NICKS.get(chat_id, {}).items():
+        nick_lines.append(f"• id{uid}: {nick}")
+    if not nick_lines:
+        nick_lines = ["• пока никому не присвоено"]
+
+    # активность
+    # возьмём топ по сообщениям (3 места)
+    top_msg = sorted(MSG_COUNT.items(), key=lambda x: x[1], reverse=True)[:3]
+    msg_lines = [f"• id{uid}: {cnt} смс / {CHAR_COUNT.get(uid,0)} симв." for uid, cnt in top_msg] or ["• пока пусто"]
+
+    return (
+        "📊 Статистика (черновик)\n\n"
+        "🏆 Топ по репутации (полученной):\n" + "\n".join(top_lines) + "\n\n"
+        "📝 Текущие ники:\n" + "\n".join(nick_lines) + "\n\n"
+        "⌨️ Активность:\n" + "\n".join(msg_lines)
+    )
 
 # ========= HEALTH-СЕРВЕР ДЛЯ RENDER =========
 app = Flask(__name__)
@@ -388,10 +501,13 @@ def main():
     application.add_handler(CommandHandler("nick", cmd_nick))
     application.add_handler(CommandHandler("8ball", cmd_8ball))
 
+    # Репутация (+1/-1) — через общий MessageHandler, чтоб работало и по реплаю, и с @username
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, rep_handler))
+
     # Кнопки
     application.add_handler(CallbackQueryHandler(on_button))
 
-    # Сообщения (триггеры) — в самом конце, чтобы не мешать командам
+    # Сообщения (триггеры и счётчики) — после репы, чтобы не перехватывать команды
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_message))
 
     # Ошибки
