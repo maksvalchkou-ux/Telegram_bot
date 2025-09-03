@@ -266,15 +266,27 @@ async def cmd_nick(update: Update, context: ContextTypes.DEFAULT_TYPE):
         new_nick = _make_nick(chat_id, prev)
 
         poll_msg = await update.message.reply_poll(
-            question=f"Меняем ник админу {target_username} на «{new_nick}»?",
-            options=["Да", "Нет"],
-            is_anonymous=False,
-            open_period=120  # 2 минуты
-        )
-        # сохранить контекст голосования
-        ADMIN_NICK_POLLS[poll_msg.poll.id] = (chat_id, target_id, target_username, new_nick)
-        _mark_cooldown(initiator.id)
-        return
+    question=f"Меняем ник админу {target_username} на «{new_nick}»?",
+    options=["Да", "Нет"],
+    is_anonymous=False,
+)
+# Сохраняем контекст
+ADMIN_NICK_POLLS[poll_msg.poll.id] = (chat_id, target_id, target_username, new_nick)
+
+# Ставим таймер на 120 секунд: сами закроем опрос и подведём итоги
+context.job_queue.run_once(
+    close_admin_poll_job,
+    when=120,
+    data={
+        "poll_id": poll_msg.poll.id,
+        "chat_id": chat_id,
+        "message_id": poll_msg.message_id,
+    },
+    name=f"closepoll:{poll_msg.poll.id}",
+)
+
+_mark_cooldown(initiator.id)
+return
 
     # обычный случай: применяем ник сразу
     _ensure_chat_maps(chat_id)
