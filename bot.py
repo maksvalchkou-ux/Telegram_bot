@@ -1,5 +1,4 @@
 import os
-import time
 import random
 import threading
 from datetime import datetime, timedelta
@@ -9,10 +8,8 @@ from flask import Flask
 from telegram import (
     Update, InlineKeyboardButton, InlineKeyboardMarkup, User, Poll
 )
-from telegram.constants import ParseMode
 from telegram.ext import (
-    Application, CommandHandler, CallbackQueryHandler, ContextTypes,
-    PollHandler
+    Application, CommandHandler, CallbackQueryHandler, ContextTypes, PollHandler
 )
 
 # ========= НАСТРОЙКИ =========
@@ -20,7 +17,8 @@ API_TOKEN = os.getenv("BOT_TOKEN")
 if not API_TOKEN:
     raise RuntimeError("BOT_TOKEN is not set")
 
-NICK_COOLDOWN = timedelta(seconds=10)  # лимит генерации на инициатора
+# >>> ВРЕМЕННО ДЛЯ ТЕСТА: 10 секунд. ПОТОМ ВЕРНИ hours=1 <<<
+NICK_COOLDOWN = timedelta(seconds=10)
 
 # ========= ТЕКСТЫ =========
 WELCOME_TEXT = (
@@ -34,14 +32,14 @@ HELP_TEXT = (
     "• /nick — сгенерировать ник себе\n"
     "• /nick @user или ответом — сгенерировать ник другу\n"
     "• Если цель — админ: запускаем голосование (2 минуты)\n"
-    "• Лимит для инициатора: 1 раз в час, антиповторы\n\n"
+    "• Лимит для инициатора: 1 раз (сейчас 10 сек для теста), антиповторы\n\n"
     "Дальше добавим репутацию, 8ball, триггеры, статистику и ачивки."
 )
 
 STATS_PLACEHOLDER = (
     "📊 Статистика (заглушка v1):\n"
     "• Топ репутации: скоро\n"
-    "• Текущие ники: показывать можем уже сейчас (в следующем шаге)\n"
+    "• Текущие ники: скоро\n"
     "• Сообщения/символы: скоро\n"
     "• Ачивки: скоро\n\n"
     "Прокачаем это на следующих шагах 😉"
@@ -58,6 +56,7 @@ BTN_HELP = "help_info"
 BTN_STATS = "stats_open"
 BTN_ACH = "ach_list"
 
+
 def main_keyboard() -> InlineKeyboardMarkup:
     keyboard = [
         [InlineKeyboardButton("🧰 Что умеет этот бот", callback_data=BTN_HELP)],
@@ -68,6 +67,7 @@ def main_keyboard() -> InlineKeyboardMarkup:
     ]
     return InlineKeyboardMarkup(keyboard)
 
+
 # ========= ПАМЯТЬ (на время работы процесса) =========
 # ники: chat_id -> { user_id: "ник" }
 NICKS: Dict[int, Dict[int, str]] = {}
@@ -75,7 +75,7 @@ NICKS: Dict[int, Dict[int, str]] = {}
 TAKEN_NICKS: Dict[int, set] = {}
 # время последней генерации никнейма инициатором: initiator_user_id -> datetime
 LAST_NICK_ACTION: Dict[int, datetime] = {}
-# известные пользователи по username (чтобы можно было /nick @username): username_lower -> user_id
+# известные пользователи по username: username_lower -> user_id
 KNOWN_USERS: Dict[str, int] = {}
 # активные голосования за ник админа: poll_id -> (chat_id, target_user_id, target_username, pending_nick)
 ADMIN_NICK_POLLS: Dict[str, Tuple[int, int, str, str]] = {}
@@ -105,23 +105,28 @@ SPICY = [
     "пират без лицензии","клоун-пофигист","барсук-бродяга"
 ]
 
+
+# ========= ВСПОМОГАТЕЛЬНОЕ =========
 def _user_key(u: User) -> str:
     return f"@{u.username}" if u.username else (u.full_name or f"id{u.id}")
 
 async def _is_admin(chat_id: int, user_id: int, context: ContextTypes.DEFAULT_TYPE) -> bool:
     try:
         member = await context.bot.get_chat_member(chat_id, user_id)
-        return member.status in ("administrator","creator","owner")
+        return member.status in ("administrator", "creator", "owner")
     except Exception:
         return False
 
 def _cooldown_ok(initiator_id: int) -> Optional[str]:
-    """Проверяем лимит 1/час. Возвращаем None, если всё ок, иначе строку с временем ожидания."""
     now = datetime.utcnow()
     last = LAST_NICK_ACTION.get(initiator_id)
     if last and now - last < NICK_COOLDOWN:
         left = (last + NICK_COOLDOWN) - now
-        mins = int(left.total_seconds() // 60) + 1
+        mins = max(1, int(left.total_seconds() // 60))
+        secs = int(left.total_seconds()) % 60
+        # для 10 сек просто покажем секунды
+        if NICK_COOLDOWN < timedelta(minutes=1):
+            return f"подожди ещё ~{secs} сек."
         return f"подожди ещё ~{mins} мин."
     return None
 
@@ -139,9 +144,8 @@ def _make_nick(chat_id: int, prev: Optional[str]) -> str:
     _ensure_chat_maps(chat_id)
     taken = TAKEN_NICKS[chat_id]
 
-    for _ in range(50):  # до 50 попыток найти не занятый и не равный prev
+    for _ in range(50):
         parts = []
-        # ~25% шанс подмешать «перчинку» вместо прилагательного
         if random.random() < 0.25:
             parts.append(random.choice(SPICY))
         else:
@@ -159,38 +163,33 @@ def _make_nick(chat_id: int, prev: Optional[str]) -> str:
             continue
         return nick
 
-    # если не нашли — возвращаем хоть что-то
     return f"{random.choice(ADJ)} {random.choice(NOUN)} {random.choice(TAILS)}"
 
 def _set_nick(chat_id: int, user_id: int, nick: str):
     _ensure_chat_maps(chat_id)
-    # освободим прежний ник из занятых
     prev = NICKS[chat_id].get(user_id)
     if prev and prev in TAKEN_NICKS[chat_id]:
         TAKEN_NICKS[chat_id].discard(prev)
-    # ставим новый
     NICKS[chat_id][user_id] = nick
     TAKEN_NICKS[chat_id].add(nick)
 
 def _resolve_target_user(update: Update) -> Optional[User]:
-    """Цель по reply приоритете — самый надёжный способ."""
     if update.message and update.message.reply_to_message:
         return update.message.reply_to_message.from_user
     return None
 
 def _resolve_target_by_arg(context: ContextTypes.DEFAULT_TYPE) -> Optional[int]:
-    """Попытка из аргумента @username найти user_id по словарю KNOWN_USERS."""
     if not context.args:
         return None
     arg = context.args[0]
     if arg.startswith("@"):
-        uid = KNOWN_USERS.get(arg[1:].lower())
-        return uid
+        return KNOWN_USERS.get(arg[1:].lower())
     return None
 
 async def _update_known_user(user: User):
     if user and user.username:
         KNOWN_USERS[user.username.lower()] = user.id
+
 
 # ========= КОМАНДЫ И КНОПКИ =========
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -211,12 +210,12 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == BTN_HELP:
         await q.message.reply_text(HELP_TEXT, reply_markup=main_keyboard())
     elif data == BTN_STATS:
-        # позже сюда подставим реальную статистику
         await q.message.reply_text(STATS_PLACEHOLDER, reply_markup=main_keyboard())
     elif data == BTN_ACH:
         await q.message.reply_text(ACHIEVEMENTS_PLACEHOLDER, reply_markup=main_keyboard())
     else:
         await q.message.reply_text("¯\\_(ツ)_/¯ Неизвестная кнопка", reply_markup=main_keyboard())
+
 
 # ---- /nick ----
 async def cmd_nick(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -227,38 +226,34 @@ async def cmd_nick(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     initiator = update.effective_user
 
-    # лимит для инициатора
     cd = _cooldown_ok(initiator.id)
     if cd:
         await update.message.reply_text(f"Потерпи, {cd}")
         return
 
-    # определяем цель
-    target_user: Optional[User] = _resolve_target_user(update)
+    # цель: приоритет — reply, затем @username, иначе сам себе
+    target_user = _resolve_target_user(update)
     target_id: Optional[int] = None
-    target_username = None
+    target_username: Optional[str] = None
 
     if target_user:
         target_id = target_user.id
         target_username = _user_key(target_user)
         await _update_known_user(target_user)
     else:
-        # попытка по аргументу @username
         by_arg_id = _resolve_target_by_arg(context)
         if by_arg_id:
             target_id = by_arg_id
-            # username отображения
             for uname, uid in KNOWN_USERS.items():
                 if uid == by_arg_id:
                     target_username = f"@{uname}"
                     break
 
-    # если цель не определена — считаем, что сам себе
     if target_id is None:
         target_id = initiator.id
         target_username = _user_key(initiator)
 
-    # голосование, если цель — админ и это не сам себе
+    # если цель — админ и это не сам себе: запускаем голосование
     is_target_admin = await _is_admin(chat_id, target_id, context)
     if is_target_admin and target_id != initiator.id:
         _ensure_chat_maps(chat_id)
@@ -266,27 +261,24 @@ async def cmd_nick(update: Update, context: ContextTypes.DEFAULT_TYPE):
         new_nick = _make_nick(chat_id, prev)
 
         poll_msg = await update.message.reply_poll(
-    question=f"Меняем ник админу {target_username} на «{new_nick}»?",
-    options=["Да", "Нет"],
-    is_anonymous=False,
-)
-# Сохраняем контекст
-ADMIN_NICK_POLLS[poll_msg.poll.id] = (chat_id, target_id, target_username, new_nick)
+            question=f"Меняем ник админу {target_username} на «{new_nick}»?",
+            options=["Да", "Нет"],
+            is_anonymous=False,
+        )
 
-# Ставим таймер на 120 секунд: сами закроем опрос и подведём итоги
-context.job_queue.run_once(
-    close_admin_poll_job,
-    when=120,
-    data={
-        "poll_id": poll_msg.poll.id,
-        "chat_id": chat_id,
-        "message_id": poll_msg.message_id,
-    },
-    name=f"closepoll:{poll_msg.poll.id}",
-)
+        # Сохраняем контекст голосования
+        ADMIN_NICK_POLLS[poll_msg.poll.id] = (chat_id, target_id, target_username, new_nick)
 
-_mark_cooldown(initiator.id)
-return
+        # Таймер: через 120 сек сами закроем опрос и подведём итог
+        context.job_queue.run_once(
+            close_admin_poll_job,
+            when=120,  # для быстрого теста можешь временно поставить 20
+            data={"poll_id": poll_msg.poll.id, "chat_id": chat_id, "message_id": poll_msg.message_id},
+            name=f"closepoll:{poll_msg.poll.id}",
+        )
+
+        _mark_cooldown(initiator.id)
+        return
 
     # обычный случай: применяем ник сразу
     _ensure_chat_maps(chat_id)
@@ -300,7 +292,8 @@ return
     else:
         await update.message.reply_text(f"{target_username} теперь известен(а) как «{new_nick}»")
 
-# ---- обработка закрытия голосований ----
+
+# ---- автособытие закрытого опроса (оставляем как резерв) ----
 async def on_poll(update: Update, context: ContextTypes.DEFAULT_TYPE):
     poll: Poll = update.poll
     if poll.id not in ADMIN_NICK_POLLS:
@@ -309,51 +302,6 @@ async def on_poll(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     chat_id, target_id, target_username, pending_nick = ADMIN_NICK_POLLS.pop(poll.id)
-    async def close_admin_poll_job(context: ContextTypes.DEFAULT_TYPE):
-    data = context.job.data
-    poll_id = data["poll_id"]
-    chat_id = data["chat_id"]
-    message_id = data["message_id"]
-
-    # Закрываем опрос и получаем финальные итоги
-    try:
-        closed_poll = await context.bot.stop_poll(chat_id=chat_id, message_id=message_id)
-    except Exception:
-        closed_poll = None
-
-    # Если по какой-то причине не получилось — попробуем добрать из нашей таблицы
-    info = ADMIN_NICK_POLLS.pop(poll_id, None)
-    if not info:
-        return  # уже обработан или не наш
-
-    target_chat_id, target_id, target_username, pending_nick = info
-
-    yes_votes = 0
-    no_votes = 0
-    if closed_poll:
-        for opt in closed_poll.options:
-            if opt.text == "Да":
-                yes_votes = opt.voter_count
-            elif opt.text == "Нет":
-                no_votes = opt.voter_count
-
-    # Если закрытый опрос не вернул данные (редко), просто сравним по наличию
-    passed = yes_votes > no_votes
-
-    if passed:
-        _ensure_chat_maps(target_chat_id)
-        prev = NICKS[target_chat_id].get(target_id)
-        if pending_nick != prev:
-            _set_nick(target_chat_id, target_id, pending_nick)
-        text = f"🎉 Голосование принято! {target_username} теперь «{pending_nick}»"
-    else:
-        text = f"❌ Голосование не прошло. Ник {target_username} остаётся без изменений."
-
-    try:
-        await context.bot.send_message(chat_id=target_chat_id, text=text)
-    except Exception:
-        pass
-    # результаты
     yes_votes = 0
     no_votes = 0
     for opt in poll.options:
@@ -370,11 +318,57 @@ async def on_poll(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text = f"🎉 Голосование принято! {target_username} теперь «{pending_nick}»"
     else:
         text = f"❌ Голосование не прошло. Ник {target_username} остаётся без изменений."
-    # отправим в чат
+
     try:
         await context.bot.send_message(chat_id=chat_id, text=text)
     except Exception:
         pass
+
+
+# ---- джоб: закрыть опрос руками и объявить результат ----
+async def close_admin_poll_job(context: ContextTypes.DEFAULT_TYPE):
+    data = context.job.data
+    poll_id = data["poll_id"]
+    chat_id = data["chat_id"]
+    message_id = data["message_id"]
+
+    # Закрываем опрос сами
+    try:
+        closed_poll = await context.bot.stop_poll(chat_id=chat_id, message_id=message_id)
+    except Exception:
+        closed_poll = None
+
+    info = ADMIN_NICK_POLLS.pop(poll_id, None)
+    if not info:
+        return
+
+    target_chat_id, target_id, target_username, pending_nick = info
+
+    yes_votes = 0
+    no_votes = 0
+    if closed_poll:
+        for opt in closed_poll.options:
+            if opt.text == "Да":
+                yes_votes = opt.voter_count
+            elif opt.text == "Нет":
+                no_votes = opt.voter_count
+
+    passed = yes_votes > no_votes
+
+    if passed:
+        _ensure_chat_maps(target_chat_id)
+        prev = NICKS[target_chat_id].get(target_id)
+        if pending_nick != prev:
+            _set_nick(target_chat_id, target_id, pending_nick)
+        result = f"🎉 Голосование принято! {target_username} теперь «{pending_nick}»"
+    else:
+        result = f"❌ Голосование не прошло. Ник {target_username} остаётся без изменений."
+
+    try:
+        await context.bot.send_message(chat_id=target_chat_id, text=result)
+    except Exception:
+        pass
+
 
 # ========= FLASK для Render (healthcheck) =========
 app = Flask(__name__)
@@ -387,25 +381,27 @@ def run_flask():
     port = int(os.getenv("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
 
+
 # ========= ENTRY =========
 def main():
-    # веб-сервер для Render
+    # Веб-сервер для Render
     threading.Thread(target=run_flask, daemon=True).start()
 
     application = Application.builder().token(API_TOKEN).build()
 
-    # команды
+    # Команды
     application.add_handler(CommandHandler("start", cmd_start))
     application.add_handler(CommandHandler("help", cmd_help))
     application.add_handler(CommandHandler("nick", cmd_nick))
 
-    # кнопки
+    # Кнопки
     application.add_handler(CallbackQueryHandler(on_button))
 
-    # голосования
+    # Голосования (резервный обработчик)
     application.add_handler(PollHandler(on_poll))
 
     application.run_polling(close_loop=False)
+
 
 if __name__ == "__main__":
     main()
