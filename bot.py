@@ -10,6 +10,7 @@ from telegram.ext import (
     Application, ApplicationBuilder, CommandHandler, CallbackQueryHandler,
     ContextTypes
 )
+from telegram.request import HTTPXRequest  # таймауты для polling
 
 # ========= НАСТРОЙКИ =========
 API_TOKEN = os.getenv("BOT_TOKEN")
@@ -26,12 +27,12 @@ WELCOME_TEXT = (
 )
 
 HELP_TEXT = (
-    "🛠 Что умеет этот бот (v1, без голосований):\n"
+    "🛠 Что умеет этот бот (v1, без голосований / polling):\n"
     "• /start — меню с кнопками\n"
     "• /nick — сгенерировать ник себе\n"
     "• /nick @user или ответом — сгенерировать ник другу (включая админа)\n"
     "• Антиповторы и кулдаун (сейчас 10 сек для теста)\n\n"
-    "Дальше добавим репутацию, 8ball, триггеры, статистику и ачивки."
+    "Сoon: триггеры, 8ball, репутация, статистика, ачивки."
 )
 
 STATS_PLACEHOLDER = (
@@ -39,14 +40,10 @@ STATS_PLACEHOLDER = (
     "• Топ репутации: скоро\n"
     "• Текущие ники: скоро\n"
     "• Сообщения/символы: скоро\n"
-    "• Ачивки: скоро\n\n"
-    "Прокачаем это на следующих шагах 😉"
+    "• Ачивки: скоро"
 )
 
-ACHIEVEMENTS_PLACEHOLDER = (
-    "🏅 Список ачивок (заглушка v1):\n"
-    "Матёрые достижения уже в разработке 😈"
-)
+ACHIEVEMENTS_PLACEHOLDER = "🏅 Список ачивок (заглушка v1)."
 
 # ========= КНОПКИ =========
 BTN_HELP = "help_info"
@@ -64,10 +61,10 @@ def main_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(keyboard)
 
 # ========= ПАМЯТЬ (in-memory) =========
-NICKS: Dict[int, Dict[int, str]] = {}      # chat_id -> { user_id: nick }
-TAKEN: Dict[int, set] = {}                 # chat_id -> set(nick)
-LAST: Dict[int, datetime] = {}             # initiator_id -> last nick time
-KNOWN: Dict[str, int] = {}                 # username_lower -> user_id
+NICKS: Dict[int, Dict[int, str]] = {}   # chat_id -> { user_id: nick }
+TAKEN: Dict[int, set] = {}              # chat_id -> set(nick)
+LAST: Dict[int, datetime] = {}          # initiator_id -> last nick time
+KNOWN: Dict[str, int] = {}              # username_lower -> user_id
 
 # ========= СЛОВАРИ ДЛЯ НИКОВ =========
 ADJ = [
@@ -160,7 +157,7 @@ def _resolve_arg_target(context: ContextTypes.DEFAULT_TYPE) -> Optional[int]:
         return KNOWN.get(arg[1:].lower())
     return None
 
-# ========= КОМАНДЫ =========
+# ========= КОМАНДЫ/КНОПКИ =========
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.message:
         await _save_known(update.effective_user)
@@ -238,7 +235,7 @@ async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
     except Exception:
         pass
 
-# ========= МАЛЕНЬКИЙ ВЕБ-СЕРВЕР ДЛЯ RENDER =========
+# ========= HEALTH-СЕРВЕР ДЛЯ RENDER =========
 app = Flask(__name__)
 @app.get("/")
 def health():
@@ -250,19 +247,27 @@ def run_flask():
 
 # ========= ENTRY =========
 async def _pre_init(app: Application):
-    # На всякий случай снесём вебхук, если вдруг остался от прошлых версий
+    # На всякий: снести webhook перед polling, чтобы не было конфликтов
     try:
         await app.bot.delete_webhook(drop_pending_updates=True)
     except Exception:
         pass
 
 def main():
-    # Render любит, когда что-то слушает порт — поднимем health-сервер
+    # Render любит, когда порт слушается — поднимем health-сервер
     threading.Thread(target=run_flask, daemon=True).start()
+
+    # Укороченные таймауты для getUpdates (меньше конфликтов)
+    req = HTTPXRequest(
+        connect_timeout=10.0,
+        read_timeout=25.0,   # long-poll чтение
+        pool_timeout=5.0,
+    )
 
     application: Application = (
         ApplicationBuilder()
         .token(API_TOKEN)
+        .get_updates_request(req)   # <— используем свои таймауты
         .post_init(_pre_init)
         .build()
     )
@@ -278,10 +283,12 @@ def main():
     # Ошибки
     application.add_error_handler(on_error)
 
-    # Принимаем все типы апдейтов
+    # Запуск polling
     from telegram import Update as TgUpdate
     application.run_polling(
         allowed_updates=TgUpdate.ALL_TYPES,
+        timeout=25,               # согласовано с read_timeout
+        poll_interval=1.0,
         drop_pending_updates=True,
         close_loop=False,
     )
