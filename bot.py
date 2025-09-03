@@ -1,10 +1,11 @@
 import os
 import random
 import asyncio
+import threading
 from aiogram import Bot, Dispatcher, types
-from aiohttp import web
+from flask import Flask
 
-# Берём токен из переменных окружения (Render → Environment)
+# Токен из переменных окружения (Render → Environment → BOT_TOKEN)
 API_TOKEN = os.getenv("BOT_TOKEN")
 
 bot = Bot(token=API_TOKEN)
@@ -32,18 +33,15 @@ reactions = {
     "утро": "Утро бывает только после обеда. 🌞"
 }
 
-
 # 🎱 Magic 8ball
 @dp.message_handler(commands=["8ball"])
 async def magic8ball(message: types.Message):
     await message.reply(random.choice(answers))
 
-
 # 🌀 Генератор никнеймов
 @dp.message_handler(commands=["nick"])
 async def nickname(message: types.Message):
     await message.reply(f"Твой новый ник: {random.choice(nicknames)}")
-
 
 # ⭐ Очки репутации
 @dp.message_handler(lambda m: "+1" in m.text or "-1" in m.text)
@@ -55,7 +53,6 @@ async def reputation_handler(message: types.Message):
         reputation[user] = reputation.get(user, 0) + change
         await message.reply(f"{user} теперь имеет {reputation[user]} очков репутации!")
 
-
 # 🗣️ Реакции на слова
 @dp.message_handler()
 async def reactions_handler(message: types.Message):
@@ -64,19 +61,25 @@ async def reactions_handler(message: types.Message):
             await message.reply(reply)
             break
 
+# ---- Мини веб-сервер (Flask) для Render ----
+app = Flask(__name__)
 
-# ---- Мини веб-сервер для Render ----
-async def handle(request):
-    return web.Response(text="Bot is running!")
+@app.get("/")
+def healthcheck():
+    return "Bot is running!"
 
-async def on_startup(_):
-    asyncio.create_task(dp.start_polling())
+def run_bot():
+    # Отдельный event loop в отдельном потоке
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    loop.run_until_complete(dp.start_polling())
 
 def main():
-    app = web.Application()
-    app.router.add_get("/", handle)
+    # Запускаем бота в фоновом потоке
+    threading.Thread(target=run_bot, daemon=True).start()
+    # Поднимаем HTTP-сервер (Render требует слушать PORT)
     port = int(os.getenv("PORT", 5000))
-    web.run_app(app, host="0.0.0.0", port=port)
+    app.run(host="0.0.0.0", port=port)
 
 if __name__ == "__main__":
     main()
