@@ -20,7 +20,7 @@ API_TOKEN = os.getenv("BOT_TOKEN")
 if not API_TOKEN:
     raise RuntimeError("BOT_TOKEN is not set")
 
-NICK_COOLDOWN = timedelta(hours=1)  # лимит генерации на инициатора
+NICK_COOLDOWN = timedelta(seconds=10)  # лимит генерации на инициатора
 
 # ========= ТЕКСТЫ =========
 WELCOME_TEXT = (
