@@ -254,31 +254,32 @@ async def cmd_nick(update: Update, context: ContextTypes.DEFAULT_TYPE):
         target_username = _user_key(initiator)
 
     # если цель — админ и это не сам себе: запускаем голосование
-    is_target_admin = await _is_admin(chat_id, target_id, context)
-    if is_target_admin and target_id != initiator.id:
-        _ensure_chat_maps(chat_id)
-        prev = NICKS[chat_id].get(target_id)
-        new_nick = _make_nick(chat_id, prev)
+is_target_admin = await _is_admin(chat_id, target_id, context)
+if is_target_admin and target_id != initiator.id:
+    _ensure_chat_maps(chat_id)
+    prev = NICKS[chat_id].get(target_id)
+    new_nick = _make_nick(chat_id, prev)
 
-        poll_msg = await update.message.reply_poll(
-            question=f"Меняем ник админу {target_username} на «{new_nick}»?",
-            options=["Да", "Нет"],
-            is_anonymous=False,
-        )
+    poll_msg = await update.message.reply_poll(
+        question=f"Меняем ник админу {target_username} на «{new_nick}»?",
+        options=["Да", "Нет"],
+        is_anonymous=False,
+        open_period=120,   # Telegram сам закроет через 2 минуты
+    )
 
-        # Сохраняем контекст голосования
-        ADMIN_NICK_POLLS[poll_msg.poll.id] = (chat_id, target_id, target_username, new_nick)
+    # сохраняем контекст опроса
+    ADMIN_NICK_POLLS[poll_msg.poll.id] = (chat_id, target_id, target_username, new_nick)
 
-        # Таймер: через 120 сек сами закроем опрос и подведём итог
-        context.job_queue.run_once(
-            close_admin_poll_job,
-            when=120,  # для быстрого теста можешь временно поставить 20
-            data={"poll_id": poll_msg.poll.id, "chat_id": chat_id, "message_id": poll_msg.message_id},
-            name=f"closepoll:{poll_msg.poll.id}",
-        )
+    # резерв: если Telegram не пришлёт событие, мы сами закроем через 125 сек
+    context.job_queue.run_once(
+        close_admin_poll_job,
+        when=125,  # для теста можно временно поставить 25
+        data={"poll_id": poll_msg.poll.id, "chat_id": chat_id, "message_id": poll_msg.message_id},
+        name=f"closepoll:{poll_msg.poll.id}",
+    )
 
-        _mark_cooldown(initiator.id)
-        return
+    _mark_cooldown(initiator.id)
+    return
 
     # обычный случай: применяем ник сразу
     _ensure_chat_maps(chat_id)
