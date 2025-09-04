@@ -4,6 +4,7 @@ import random
 import threading
 import html
 import json
+import asyncio
 from datetime import datetime, timedelta, timezone
 from typing import Dict, Optional, Set, Tuple, List
 
@@ -14,20 +15,33 @@ from telegram.ext import (
     MessageHandler, ContextTypes, filters
 )
 from telegram.request import HTTPXRequest
+import httpx
 
 # ========= НАСТРОЙКИ =========
 API_TOKEN = os.getenv("BOT_TOKEN")
 if not API_TOKEN:
     raise RuntimeError("BOT_TOKEN is not set")
 
-# Кулдаун на генерацию никнейма инициатором (1 час)
-NICK_COOLDOWN = timedelta(hours=1)
-# Антиспам для авто-триггеров (на чат)
-TRIGGER_COOLDOWN = timedelta(seconds=20)
-# Лимит репутации: сколько выдач (+/-) один пользователь может сделать за 24 часа
-REP_DAILY_LIMIT = 10
+# Облако через GitHub Gist
+GIST_TOKEN = os.getenv("GIST_TOKEN")
+GIST_ID = os.getenv("GIST_ID")
+GIST_FILENAME = os.getenv("GIST_FILENAME", "chat_state.json")
+
+# Самопинг: публичный URL сервиса (например, https://<name>.onrender.com/health)
+SELF_URL = os.getenv("SELF_URL")
+
+# Кулдауны и лимиты
+NICK_COOLDOWN = timedelta(hours=1)           # кулдаун инициатора /nick (глобально по пользователю)
+TRIGGER_COOLDOWN = timedelta(seconds=20)     # антиспам автоответов (по чату)
+REP_DAILY_LIMIT = 10                         # лимит выдач +/-1 на человека за 24ч В КАЖДОМ ЧАТЕ
 REP_WINDOW = timedelta(hours=24)
 UTC = timezone.utc
+
+# Кеш админов (TTL)
+ADMINS_TTL_SEC = 600
+
+# Файл локального бэкапа (на случай недоступности Gist)
+LOCAL_BACKUP = "state_backup.json"
 
 # ========= ТЕКСТЫ =========
 WELCOME_TEXT = (
@@ -40,9 +54,10 @@ HELP_TEXT = (
     "• /nick — ник себе; /nick @user или ответом — ник другу\n"
     "• /8ball вопрос — магический шар отвечает\n"
     "• +1 / -1 — репутация по реплаю или с @username\n"
-    "• «📊 Статистика» — топ-10 репы, ники, активность и ачивки\n"
-    "• /export — сохранить данные (только админ)\n"
-    "• /import — восстановить данные (только админ)\n"
+    "• «📊 Статистика» — топ-10 репы, ники, активность и ачивки (по текущему чату)\n"
+    "• /export — сохранить ВСЮ базу (все чаты) (только админ)\n"
+    "• /export_here — сохранить только текущий чат (только админ)\n"
+    "• /import — восстановить ТЕКУЩИЙ чат из файла (только админ)\n"
 )
 STATS_TITLE = "📊 Статистика"
 
@@ -58,51 +73,54 @@ def main_keyboard() -> InlineKeyboardMarkup:
 
 # ========= ПАМЯТЬ (in-memory) =========
 # — ники
-NICKS: Dict[int, Dict[int, str]] = {}     # chat_id -> { user_id: nick }
-TAKEN: Dict[int, Set[str]] = {}           # chat_id -> set(nick)
-LAST_NICK: Dict[int, datetime] = {}       # initiator_id -> last nick time
+NICKS: Dict[int, Dict[int, str]] = {}              # chat_id -> { user_id: nick }
+TAKEN: Dict[int, Set[str]] = {}                    # chat_id -> set(nick)
+LAST_NICK: Dict[int, datetime] = {}                # initiator_id -> last nick time (ГЛОБАЛЬНО по пользователю)
 
-# — известные @username и имена
-KNOWN: Dict[str, int] = {}                # username_lower -> user_id
-NAMES: Dict[int, str] = {}                # user_id -> last display name (@username > full_name)
+# — известные @username и имена (общие на все чаты)
+KNOWN: Dict[str, int] = {}                         # username_lower -> user_id
+NAMES: Dict[int, str] = {}                         # user_id -> last display name (@username > full_name)
 
 # — триггеры
-LAST_TRIGGER_TIME: Dict[int, datetime] = {}  # chat_id -> last trigger time
+LAST_TRIGGER_TIME: Dict[int, datetime] = {}        # chat_id -> last trigger time
 
-# — репутация
-REP_GIVEN: Dict[int, int] = {}            # user_id -> суммарно выдал (+/-)
-REP_RECEIVED: Dict[int, int] = {}         # user_id -> суммарно получил
-REP_POS_GIVEN: Dict[int, int] = {}        # user_id -> выдано +1
-REP_NEG_GIVEN: Dict[int, int] = {}        # user_id -> выдано -1
-# история выдач (+/-) для дневного лимита: user_id -> [utc datetimes]
-REP_GIVE_TIMES: Dict[int, List[datetime]] = {}
+# — РЕПУТАЦИЯ И СЧЁТЧИКИ ТЕПЕРЬ ПО ЧАТАМ —
+# формат: MAP[chat_id][user_id] = value
+REP_GIVEN: Dict[int, Dict[int, int]] = {}
+REP_RECEIVED: Dict[int, Dict[int, int]] = {}
+REP_POS_GIVEN: Dict[int, Dict[int, int]] = {}
+REP_NEG_GIVEN: Dict[int, Dict[int, int]] = {}
+# История выдач для дневного лимита: REP_GIVE_TIMES[chat_id][giver_id] = [utc datetimes]
+REP_GIVE_TIMES: Dict[int, Dict[int, List[datetime]]] = {}
 
-# — счётчики
-MSG_COUNT: Dict[int, int] = {}            # user_id -> сообщений
-CHAR_COUNT: Dict[int, int] = {}           # user_id -> символов
-NICK_CHANGE_COUNT: Dict[int, int] = {}    # user_id -> сколько раз меняли ник
-EIGHTBALL_COUNT: Dict[int, int] = {}      # user_id -> вызовов 8ball
-TRIGGER_HITS: Dict[int, int] = {}         # user_id -> сколько раз триггерил бот
-BEER_HITS: Dict[int, int] = {}            # user_id -> сколько раз словил «пиво»-триггер
-LAST_MSG_AT: Dict[int, datetime] = {}     # user_id -> последний момент, когда писал
+MSG_COUNT: Dict[int, Dict[int, int]] = {}
+CHAR_COUNT: Dict[int, Dict[int, int]] = {}
+NICK_CHANGE_COUNT: Dict[int, Dict[int, int]] = {}
+EIGHTBALL_COUNT: Dict[int, Dict[int, int]] = {}
+TRIGGER_HITS: Dict[int, Dict[int, int]] = {}
+BEER_HITS: Dict[int, Dict[int, int]] = {}
+LAST_MSG_AT: Dict[int, Dict[int, datetime]] = {}
 
-# — админ-взаимодействия
-ADMIN_PLUS_GIVEN: Dict[int, int] = {}     # user_id -> сколько раз поставил +1 админам
-ADMIN_MINUS_GIVEN: Dict[int, int] = {}    # user_id -> сколько раз поставил -1 админам
+ADMIN_PLUS_GIVEN: Dict[int, Dict[int, int]] = {}
+ADMIN_MINUS_GIVEN: Dict[int, Dict[int, int]] = {}
 
-# — ачивки
-ACHIEVEMENTS: Dict[int, Set[str]] = {}    # user_id -> set(title)
+ACHIEVEMENTS: Dict[int, Dict[int, Set[str]]] = {}  # chat_id -> { user_id -> set(titles) }
 
-def _achieve(user_id: int, title: str) -> bool:
-    got = ACHIEVEMENTS.setdefault(user_id, set())
+# — кеш админов: chat_id -> (set(user_id), expires_ts)
+ADMINS_CACHE: Dict[int, Tuple[Set[int], float]] = {}
+
+# — общий лок на состояние
+STATE_LOCK = asyncio.Lock()
+
+def _achieve(chat_id: int, user_id: int, title: str) -> bool:
+    got = ACHIEVEMENTS.setdefault(chat_id, {}).setdefault(user_id, set())
     if title in got:
         return False
     got.add(title)
     return True
 
-# ========= АЧИВКИ (название -> (описание, условие-объяснение)) =========
+# ========= АЧИВКИ =========
 ACH_LIST: Dict[str, Tuple[str, str]] = {
-    # базовые
     "Читер ёбаный":         ("попытка поставить +1 самому себе",         "Сам себе +1 — нельзя."),
     "Никофил ебучий":       ("5 смен никнейма",                           "Сменил ник ≥ 5 раз."),
     "Ник-коллекционер":     ("10 смен никнейма",                          "Сменил ник ≥ 10 раз."),
@@ -116,7 +134,6 @@ ACH_LIST: Dict[str, Tuple[str, str]] = {
     "Клаводробилка":        ("настрочил 5000 символов",                   "Символов ≥ 5000."),
     "Писарь-маховик":       ("накидал 100 сообщений",                     "Сообщений ≥ 100."),
     "Триггер-мейкер":       ("15 раз триггерил бота",                     "Любых триггеров ≥ 15."),
-    # взаимодействия с админом и «соц» очивки
     "Тронолом":             ("менял ник админа",                          "Сменил ник пользователю-админу."),
     "Подхалим генеральский":("поставил +1 админу 5 раз",                  "Выдал +1 админам ≥ 5."),
     "Ужалил короля":        ("влепил -1 админам 3 раза",                  "Выдал -1 админам ≥ 3."),
@@ -125,7 +142,6 @@ ACH_LIST: Dict[str, Tuple[str, str]] = {
     "Пошёл смотреть коров": ("пропадал 5 дней",                           "Перерыв ≥ 5 дней."),
     "Споткнулся о ***":     ("пропадал 3 дня",                            "Перерыв ≥ 3 дня."),
     "Сортирный поэт":       ("шутит ниже пояса",                          "NSFW-слова в сообщениях."),
-    # большие цифры
     "Король репы":          ("репутация как у бога",                      "Полученная репутация ≥ 100."),
     "Минусатор-маньяк":     ("раздал -1 десять раз",                      "Выдано -1 ≥ 10."),
     "Флудераст":            ("спамил как шаман",                          "Сообщений ≥ 300."),
@@ -157,7 +173,6 @@ SPICY = [
 ]
 
 # ========= ТРИГГЕРЫ =========
-# индекс 1 — «пиво», чтобы отдельно считать BEER_HITS
 TRIGGERS = [
     (re.compile(r"\bработ(а|ать|аю|аем|ает|ал|али|ать|у|ы|е|ой)\b", re.IGNORECASE),
      ["Работка подъехала? Держись, чемпион 🛠️",
@@ -193,10 +208,24 @@ async def _remember_user(u: Optional[User]):
         NAMES[u.id] = u.full_name or f"id{u.id}"
 
 def _ensure_chat(chat_id: int):
-    if chat_id not in NICKS:
-        NICKS[chat_id] = {}
-    if chat_id not in TAKEN:
-        TAKEN[chat_id] = set()
+    # структуры per-chat
+    NICKS.setdefault(chat_id, {})
+    TAKEN.setdefault(chat_id, set())
+    REP_GIVEN.setdefault(chat_id, {})
+    REP_RECEIVED.setdefault(chat_id, {})
+    REP_POS_GIVEN.setdefault(chat_id, {})
+    REP_NEG_GIVEN.setdefault(chat_id, {})
+    REP_GIVE_TIMES.setdefault(chat_id, {})
+    MSG_COUNT.setdefault(chat_id, {})
+    CHAR_COUNT.setdefault(chat_id, {})
+    NICK_CHANGE_COUNT.setdefault(chat_id, {})
+    EIGHTBALL_COUNT.setdefault(chat_id, {})
+    TRIGGER_HITS.setdefault(chat_id, {})
+    BEER_HITS.setdefault(chat_id, {})
+    LAST_MSG_AT.setdefault(chat_id, {})
+    ADMIN_PLUS_GIVEN.setdefault(chat_id, {})
+    ADMIN_MINUS_GIVEN.setdefault(chat_id, {})
+    ACHIEVEMENTS.setdefault(chat_id, {})
 
 def _cooldown_text(uid: int) -> Optional[str]:
     now = datetime.now(UTC)
@@ -238,34 +267,228 @@ def _apply_nick(chat_id: int, user_id: int, new_nick: str):
         TAKEN[chat_id].discard(prev)
     NICKS[chat_id][user_id] = new_nick
     TAKEN[chat_id].add(new_nick)
-    _inc(NICK_CHANGE_COUNT, user_id)
+    _inc(NICK_CHANGE_COUNT[chat_id], user_id)
+
+async def _fetch_admins(context: ContextTypes.DEFAULT_TYPE, chat_id: int) -> Set[int]:
+    now = datetime.now().timestamp()
+    cached = ADMINS_CACHE.get(chat_id)
+    if cached and cached[1] > now:
+        return cached[0]
+    try:
+        admins = await context.bot.get_chat_administrators(chat_id)
+        ids = {a.user.id for a in admins}
+        ADMINS_CACHE[chat_id] = (ids, now + ADMINS_TTL_SEC)
+        return ids
+    except Exception:
+        ADMINS_CACHE[chat_id] = (set(), now + 60)
+        return set()
 
 async def _is_admin(chat_id: int, user_id: int, context: ContextTypes.DEFAULT_TYPE) -> bool:
-    try:
-        m = await context.bot.get_chat_member(chat_id, user_id)
-        return m.status in ("administrator", "creator")
-    except Exception:
-        return False
+    ids = await _fetch_admins(context, chat_id)
+    return user_id in ids
 
-def _within_limit_and_mark(giver_id: int) -> Tuple[bool, Optional[int]]:
-    """Проверка дневного лимита выдачи репутации (±1) за 24 часа.
-       Возвращает (ok, secs_left_until_free_slot)."""
+def _within_limit_and_mark(chat_id: int, giver_id: int) -> Tuple[bool, Optional[int]]:
+    """Проверка дневного лимита выдачи репутации (±1) за 24 часа — ПО ЧАТУ."""
     now = datetime.now(UTC)
-    arr = REP_GIVE_TIMES.get(giver_id, [])
+    per_chat = REP_GIVE_TIMES.setdefault(chat_id, {})
+    arr = per_chat.get(giver_id, [])
     # чистим старые
     arr = [t for t in arr if now - t < REP_WINDOW]
-    REP_GIVE_TIMES[giver_id] = arr
+    per_chat[giver_id] = arr
     if len(arr) >= REP_DAILY_LIMIT:
         oldest = min(arr)
         secs = int((oldest + REP_WINDOW - now).total_seconds())
         return False, max(1, secs)
     # ок, добавим этот вызов
     arr.append(now)
-    REP_GIVE_TIMES[giver_id] = arr
+    per_chat[giver_id] = arr
     return True, None
 
 def _name_or_id(uid: int) -> str:
     return NAMES.get(uid, f"id{uid}")
+
+# ========= ПЕРСИСТЕНТНОСТЬ =========
+def _serialize_state() -> dict:
+    def conv_nested_datetime(dct):
+        # конвертируем datetime в iso по всем слоям где нужно
+        return {
+            str(k): {str(kk): vv.isoformat() for kk, vv in v.items()}
+            for k, v in dct.items()
+        }
+
+    return {
+        "NICKS": NICKS,
+        "TAKEN": {str(cid): list(vals) for cid, vals in TAKEN.items()},
+        "LAST_NICK": {str(k): v.isoformat() for k, v in LAST_NICK.items()},
+        "KNOWN": KNOWN,
+        "NAMES": NAMES,
+
+        "REP_GIVEN": REP_GIVEN,
+        "REP_RECEIVED": REP_RECEIVED,
+        "REP_POS_GIVEN": REP_POS_GIVEN,
+        "REP_NEG_GIVEN": REP_NEG_GIVEN,
+        "REP_GIVE_TIMES": {
+            str(cid): {str(uid): [t.isoformat() for t in arr] for uid, arr in per.items()}
+            for cid, per in REP_GIVE_TIMES.items()
+        },
+
+        "MSG_COUNT": MSG_COUNT,
+        "CHAR_COUNT": CHAR_COUNT,
+        "NICK_CHANGE_COUNT": NICK_CHANGE_COUNT,
+        "EIGHTBALL_COUNT": EIGHTBALL_COUNT,
+        "TRIGGER_HITS": TRIGGER_HITS,
+        "BEER_HITS": BEER_HITS,
+        "LAST_MSG_AT": {
+            str(cid): {str(uid): dt.isoformat() for uid, dt in per.items()}
+            for cid, per in LAST_MSG_AT.items()
+        },
+
+        "ADMIN_PLUS_GIVEN": ADMIN_PLUS_GIVEN,
+        "ADMIN_MINUS_GIVEN": ADMIN_MINUS_GIVEN,
+        "ACHIEVEMENTS": {
+            str(cid): {str(uid): list(titles) for uid, titles in per.items()}
+            for cid, per in ACHIEVEMENTS.items()
+        },
+    }
+
+def _apply_state(data: dict, target_chat_id: Optional[int] = None, only_this_chat: bool = False):
+    """
+    если target_chat_id и only_this_chat=True — импортируем ТОЛЬКО секцию этого чата (merge).
+    если only_this_chat=False — грузим всё как есть (глобальный импорт/восстановление).
+    """
+
+    def to_int_dict(d):
+        return {int(k): v for k, v in d.items()}
+
+    def to_nested_int_dict(d):
+        return {int(k): {int(kk): vv for kk, vv in v.items()} for k, v in d.items()}
+
+    # helper для LAST_* и дат
+    def parse_dt(s): return datetime.fromisoformat(s)
+
+    if only_this_chat and target_chat_id is not None:
+        cid = str(target_chat_id)
+
+        # пер-чатные секции
+        for store, key, caster in [
+            (NICKS, "NICKS", lambda x: {int(uid): nick for uid, nick in x.get(cid, {}).items()}),
+            (TAKEN, "TAKEN", lambda x: set(x.get(cid, []))),
+            (REP_GIVEN, "REP_GIVEN", lambda x: {int(uid): int(v) for uid, v in x.get(cid, {}).items()}),
+            (REP_RECEIVED, "REP_RECEIVED", lambda x: {int(uid): int(v) for uid, v in x.get(cid, {}).items()}),
+            (REP_POS_GIVEN, "REP_POS_GIVEN", lambda x: {int(uid): int(v) for uid, v in x.get(cid, {}).items()}),
+            (REP_NEG_GIVEN, "REP_NEG_GIVEN", lambda x: {int(uid): int(v) for uid, v in x.get(cid, {}).items()}),
+            (MSG_COUNT, "MSG_COUNT", lambda x: {int(uid): int(v) for uid, v in x.get(cid, {}).items()}),
+            (CHAR_COUNT, "CHAR_COUNT", lambda x: {int(uid): int(v) for uid, v in x.get(cid, {}).items()}),
+            (NICK_CHANGE_COUNT, "NICK_CHANGE_COUNT", lambda x: {int(uid): int(v) for uid, v in x.get(cid, {}).items()}),
+            (EIGHTBALL_COUNT, "EIGHTBALL_COUNT", lambda x: {int(uid): int(v) for uid, v in x.get(cid, {}).items()}),
+            (TRIGGER_HITS, "TRIGGER_HITS", lambda x: {int(uid): int(v) for uid, v in x.get(cid, {}).items()}),
+            (BEER_HITS, "BEER_HITS", lambda x: {int(uid): int(v) for uid, v in x.get(cid, {}).items()}),
+            (ADMIN_PLUS_GIVEN, "ADMIN_PLUS_GIVEN", lambda x: {int(uid): int(v) for uid, v in x.get(cid, {}).items()}),
+            (ADMIN_MINUS_GIVEN, "ADMIN_MINUS_GIVEN", lambda x: {int(uid): int(v) for uid, v in x.get(cid, {}).items()}),
+        ]:
+            store[target_chat_id] = caster(data.get(key, {}))
+
+        # даты
+        last_msg_src = data.get("LAST_MSG_AT", {}).get(cid, {})
+        LAST_MSG_AT[target_chat_id] = {int(uid): parse_dt(v) for uid, v in last_msg_src.items()}
+
+        rep_times_src = data.get("REP_GIVE_TIMES", {}).get(cid, {})
+        REP_GIVE_TIMES[target_chat_id] = {int(uid): [parse_dt(t) for t in arr] for uid, arr in rep_times_src.items()}
+
+        ach_src = data.get("ACHIEVEMENTS", {}).get(cid, {})
+        ACHIEVEMENTS[target_chat_id] = {int(uid): set(titles) for uid, titles in ach_src.items()}
+
+        # глобальные справочники не трогаем при /import_here
+        return
+
+    # иначе — грузим весь слепок
+    NICKS.clear(); NICKS.update(to_nested_int_dict(data.get("NICKS", {})))
+    TAKEN.clear(); TAKEN.update({int(cid): set(vals) for cid, vals in data.get("TAKEN", {}).items()})
+    LAST_NICK.clear(); LAST_NICK.update({int(k): parse_dt(v) for k, v in data.get("LAST_NICK", {}).items()})
+    KNOWN.clear(); KNOWN.update({k: int(v) for k, v in data.get("KNOWN", {}).items()})
+    NAMES.clear(); NAMES.update({int(k): v for k, v in data.get("NAMES", {}).items()})
+
+    def load_int2int_nested(key):
+        return to_nested_int_dict({cid: {uid: int(val) for uid, val in per.items()}
+                                   for cid, per in data.get(key, {}).items()})
+
+    REP_GIVEN.clear(); REP_GIVEN.update(load_int2int_nested("REP_GIVEN"))
+    REP_RECEIVED.clear(); REP_RECEIVED.update(load_int2int_nested("REP_RECEIVED"))
+    REP_POS_GIVEN.clear(); REP_POS_GIVEN.update(load_int2int_nested("REP_POS_GIVEN"))
+    REP_NEG_GIVEN.clear(); REP_NEG_GIVEN.update(load_int2int_nested("REP_NEG_GIVEN"))
+
+    REP_GIVE_TIMES.clear()
+    for cid, per in data.get("REP_GIVE_TIMES", {}).items():
+        cid_i = int(cid)
+        REP_GIVE_TIMES[cid_i] = {int(uid): [parse_dt(t) for t in arr] for uid, arr in per.items()}
+
+    MSG_COUNT.clear(); MSG_COUNT.update(load_int2int_nested("MSG_COUNT"))
+    CHAR_COUNT.clear(); CHAR_COUNT.update(load_int2int_nested("CHAR_COUNT"))
+    NICK_CHANGE_COUNT.clear(); NICK_CHANGE_COUNT.update(load_int2int_nested("NICK_CHANGE_COUNT"))
+    EIGHTBALL_COUNT.clear(); EIGHTBALL_COUNT.update(load_int2int_nested("EIGHTBALL_COUNT"))
+    TRIGGER_HITS.clear(); TRIGGER_HITS.update(load_int2int_nested("TRIGGER_HITS"))
+    BEER_HITS.clear(); BEER_HITS.update(load_int2int_nested("BEER_HITS"))
+
+    LAST_MSG_AT.clear()
+    for cid, per in data.get("LAST_MSG_AT", {}).items():
+        cid_i = int(cid)
+        LAST_MSG_AT[cid_i] = {int(uid): parse_dt(v) for uid, v in per.items()}
+
+    ADMIN_PLUS_GIVEN.clear(); ADMIN_PLUS_GIVEN.update(load_int2int_nested("ADMIN_PLUS_GIVEN"))
+    ADMIN_MINUS_GIVEN.clear(); ADMIN_MINUS_GIVEN.update(load_int2int_nested("ADMIN_MINUS_GIVEN"))
+
+    ACHIEVEMENTS.clear()
+    for cid, per in data.get("ACHIEVEMENTS", {}).items():
+        cid_i = int(cid)
+        ACHIEVEMENTS[cid_i] = {int(uid): set(titles) for uid, titles in per.items()}
+
+async def cloud_save():
+    payload = _serialize_state()
+    text = json.dumps(payload, ensure_ascii=False, indent=2)
+
+    # Локальный бэкап — всегда
+    try:
+        with open(LOCAL_BACKUP, "w", encoding="utf-8") as f:
+            f.write(text)
+    except Exception:
+        pass
+
+    if not (GIST_TOKEN and GIST_ID):
+        return
+
+    url = f"https://api.github.com/gists/{GIST_ID}"
+    headers = {"Authorization": f"Bearer {GIST_TOKEN}", "Accept": "application/vnd.github+json"}
+    async with httpx.AsyncClient(timeout=12.0) as client:
+        try:
+            await client.patch(url, json={"files": {GIST_FILENAME: {"content": text}}}, headers=headers)
+        except Exception:
+            pass  # пробуем в следующий раз
+
+async def cloud_load_if_any():
+    # 1) пробуем Gist
+    if GIST_TOKEN and GIST_ID:
+        url = f"https://api.github.com/gists/{GIST_ID}"
+        headers = {"Authorization": f"Bearer {GIST_TOKEN}", "Accept": "application/vnd.github+json"}
+        async with httpx.AsyncClient(timeout=12.0) as client:
+            try:
+                r = await client.get(url, headers=headers)
+                if r.status_code == 200:
+                    j = r.json()
+                    files = j.get("files", {})
+                    if GIST_FILENAME in files and files[GIST_FILENAME].get("content"):
+                        data = json.loads(files[GIST_FILENAME]["content"])
+                        _apply_state(data, only_this_chat=False)
+                        return
+            except Exception:
+                pass
+    # 2) локальный бэкап
+    try:
+        if os.path.exists(LOCAL_BACKUP):
+            with open(LOCAL_BACKUP, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            _apply_state(data, only_this_chat=False)
+    except Exception:
+        pass
 
 # ========= КОМАНДЫ/КНОПКИ =========
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -300,7 +523,6 @@ async def cmd_nick(update: Update, context: ContextTypes.DEFAULT_TYPE):
     _ensure_chat(chat_id)
 
     initiator = update.effective_user
-
     cd = _cooldown_text(initiator.id)
     if cd:
         await update.message.reply_text(f"Потерпи, {cd}")
@@ -332,20 +554,24 @@ async def cmd_nick(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     prev = NICKS[chat_id].get(target_id)
     new_nick = _make_nick(chat_id, prev)
-    _apply_nick(chat_id, target_id, new_nick)
-    _mark_nick(initiator.id)
+    async with STATE_LOCK:
+        _apply_nick(chat_id, target_id, new_nick)
+        _mark_nick(initiator.id)
 
-    # ачивки за ники
-    cnt = NICK_CHANGE_COUNT.get(target_id, 0)
-    if cnt >= 5 and _achieve(target_id, "Никофил ебучий"):
+        # ачивки за ники (по чату)
+        cnt = NICK_CHANGE_COUNT[chat_id].get(target_id, 0)
+        nick5 = (cnt >= 5 and _achieve(chat_id, target_id, "Никофил ебучий"))
+        nick10 = (cnt >= 10 and _achieve(chat_id, target_id, "Ник-коллекционер"))
+
+    if nick5:
         await _announce_achievement(context, chat_id, target_id, "Никофил ебучий")
-    if cnt >= 10 and _achieve(target_id, "Ник-коллекционер"):
+    if nick10:
         await _announce_achievement(context, chat_id, target_id, "Ник-коллекционер")
 
     # ачивка за взаимодействие с админом (если менял ник не себе)
     if target_id != initiator.id:
         if await _is_admin(chat_id, target_id, context):
-            if _achieve(initiator.id, "Тронолом"):
+            if _achieve(chat_id, initiator.id, "Тронолом"):
                 await _announce_achievement(context, chat_id, initiator.id, "Тронолом")
 
     if target_id == initiator.id:
@@ -365,12 +591,18 @@ async def cmd_8ball(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message:
         return
     await _remember_user(update.effective_user)
+    chat_id = update.effective_chat.id
+    _ensure_chat(chat_id)
+
     uid = update.effective_user.id
-    _inc(EIGHTBALL_COUNT, uid)
-    if EIGHTBALL_COUNT.get(uid, 0) >= 10 and _achieve(uid, "Шароман долбанный"):
-        await _announce_achievement(context, update.effective_chat.id, uid, "Шароман долбанный")
-    if EIGHTBALL_COUNT.get(uid, 0) >= 30 and _achieve(uid, "Секретный дрочер шара"):
-        await _announce_achievement(context, update.effective_chat.id, uid, "Секретный дрочер шара")
+    async with STATE_LOCK:
+        _inc(EIGHTBALL_COUNT[chat_id], uid)
+        c10 = (EIGHTBALL_COUNT[chat_id].get(uid, 0) >= 10 and _achieve(chat_id, uid, "Шароман долбанный"))
+        c30 = (EIGHTBALL_COUNT[chat_id].get(uid, 0) >= 30 and _achieve(chat_id, uid, "Секретный дрочер шара"))
+    if c10:
+        await _announce_achievement(context, chat_id, uid, "Шароман долбанный")
+    if c30:
+        await _announce_achievement(context, chat_id, uid, "Секретный дрочер шара")
 
     q = " ".join(context.args).strip()
     if not q:
@@ -378,7 +610,7 @@ async def cmd_8ball(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     await update.message.reply_text(random.choice(EIGHT_BALL))
 
-# ---- ЕДИНЫЙ ОБРАБОТЧИК ТЕКСТА: счётчики → репутация → триггеры/NSFW/AFK ----
+# ---- ЕДИНЫЙ ОБРАБОТЧИК ТЕКСТА ----
 REP_CMD = re.compile(r"^[\+\-]1(\b|$)", re.IGNORECASE)
 
 def _trigger_allowed(chat_id: int) -> bool:
@@ -408,39 +640,54 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if msg.from_user.is_bot:
         return
 
+    chat_id = update.effective_chat.id
+    _ensure_chat(chat_id)
+
     # запомним имя/@username
     await _remember_user(msg.from_user)
 
-    # === 0) AFK-ачивки: проверяем разрыв с прошлого сообщения ===
+    # === 0) AFK-ачивки: проверяем разрыв с прошлого сообщения (по чату) ===
     now = datetime.now(UTC)
     uid = msg.from_user.id
-    if uid in LAST_MSG_AT:
-        gap = now - LAST_MSG_AT[uid]
-        if gap >= timedelta(days=5) and _achieve(uid, "Пошёл смотреть коров"):
-            await _announce_achievement(context, update.effective_chat.id, uid, "Пошёл смотреть коров")
-        elif gap >= timedelta(days=3) and _achieve(uid, "Споткнулся о ***"):
-            await _announce_achievement(context, update.effective_chat.id, uid, "Споткнулся о ***")
-    LAST_MSG_AT[uid] = now
+    afk5 = afk3 = False
+    prev = LAST_MSG_AT[chat_id].get(uid)
+    if prev:
+        gap = now - prev
+        if gap >= timedelta(days=5):
+            afk5 = _achieve(chat_id, uid, "Пошёл смотреть коров")
+        elif gap >= timedelta(days=3):
+            afk3 = _achieve(chat_id, uid, "Споткнулся о ***")
+    LAST_MSG_AT[chat_id][uid] = now
 
-    # === 1) Счётчики активности ===
+    if afk5:
+        await _announce_achievement(context, chat_id, uid, "Пошёл смотреть коров")
+    elif afk3:
+        await _announce_achievement(context, chat_id, uid, "Споткнулся о ***")
+
+    # === 1) Счётчики активности (по чату) ===
     text = (msg.text or "")
-    _inc(MSG_COUNT, uid)
-    _inc(CHAR_COUNT, uid, by=len(text))
-    # объёмные ачивки
-    if CHAR_COUNT.get(uid, 0) >= 5000 and _achieve(uid, "Клаводробилка"):
-        await _announce_achievement(context, update.effective_chat.id, uid, "Клаводробилка")
-    if CHAR_COUNT.get(uid, 0) >= 20000 and _achieve(uid, "Словесный понос"):
-        await _announce_achievement(context, update.effective_chat.id, uid, "Словесный понос")
-    if MSG_COUNT.get(uid, 0) >= 100 and _achieve(uid, "Писарь-маховик"):
-        await _announce_achievement(context, update.effective_chat.id, uid, "Писарь-маховик")
-    if MSG_COUNT.get(uid, 0) >= 300 and _achieve(uid, "Флудераст"):
-        await _announce_achievement(context, update.effective_chat.id, uid, "Флудераст")
+    async with STATE_LOCK:
+        _inc(MSG_COUNT[chat_id], uid)
+        _inc(CHAR_COUNT[chat_id], uid, by=len(text))
+        ch5000 = (CHAR_COUNT[chat_id].get(uid, 0) >= 5000 and _achieve(chat_id, uid, "Клаводробилка"))
+        ch20000 = (CHAR_COUNT[chat_id].get(uid, 0) >= 20000 and _achieve(chat_id, uid, "Словесный понос"))
+        m100 = (MSG_COUNT[chat_id].get(uid, 0) >= 100 and _achieve(chat_id, uid, "Писарь-маховик"))
+        m300 = (MSG_COUNT[chat_id].get(uid, 0) >= 300 and _achieve(chat_id, uid, "Флудераст"))
+
+    if ch5000:
+        await _announce_achievement(context, chat_id, uid, "Клаводробилка")
+    if ch20000:
+        await _announce_achievement(context, chat_id, uid, "Словесный понос")
+    if m100:
+        await _announce_achievement(context, chat_id, uid, "Писарь-маховик")
+    if m300:
+        await _announce_achievement(context, chat_id, uid, "Флудераст")
 
     t = text.strip()
     if not t:
         return
 
-    # === 2) Репутация (+1/-1) ===
+    # === 2) Репутация (+1/-1) — всё по текущему чату ===
     if REP_CMD.match(t):
         is_plus = t.startswith("+")
         giver = msg.from_user
@@ -465,8 +712,8 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await msg.reply_text("Кому ставим репу? Ответь на сообщение или укажи @username.")
             return
 
-        # лимит выдач за 24 часа
-        ok, secs_left = _within_limit_and_mark(giver.id)
+        # лимит выдач по чату
+        ok, secs_left = _within_limit_and_mark(chat_id, giver.id)
         if not ok:
             mins = (secs_left or 60) // 60
             await msg.reply_text(f"Лимит репутации на 24 часа исчерпан (10/10). Попробуй через ~{mins} мин.")
@@ -474,53 +721,54 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         # запрет «+1 себе»
         if is_plus and target_id == giver.id:
-            if _achieve(giver.id, "Читер ёбаный"):
+            if _achieve(chat_id, giver.id, "Читер ёбаный"):
                 await msg.reply_text("«Читер ёбаный» 🏅 — за попытку +1 себе. Нельзя!")
             else:
                 await msg.reply_text("Нельзя +1 себе, хорош мухлевать 🐍")
             return
 
         delta = 1 if is_plus else -1
-        _inc(REP_RECEIVED, target_id, by=delta)
-        _inc(REP_GIVEN, giver.id, by=delta)
-        if delta > 0:
-            _inc(REP_POS_GIVEN, giver.id)
-        else:
-            _inc(REP_NEG_GIVEN, giver.id)
+        async with STATE_LOCK:
+            _inc(REP_RECEIVED[chat_id], target_id, by=delta)
+            _inc(REP_GIVEN[chat_id], giver.id, by=delta)
+            if delta > 0:
+                _inc(REP_POS_GIVEN[chat_id], giver.id)
+            else:
+                _inc(REP_NEG_GIVEN[chat_id], giver.id)
 
         # админ-взаимодействия
         try:
-            if await _is_admin(update.effective_chat.id, target_id, context):
+            if await _is_admin(chat_id, target_id, context):
                 if delta > 0:
-                    _inc(ADMIN_PLUS_GIVEN, giver.id)
-                    if ADMIN_PLUS_GIVEN.get(giver.id, 0) >= 5 and _achieve(giver.id, "Подхалим генеральский"):
-                        await _announce_achievement(context, update.effective_chat.id, giver.id, "Подхалим генеральский")
+                    _inc(ADMIN_PLUS_GIVEN[chat_id], giver.id)
+                    if ADMIN_PLUS_GIVEN[chat_id].get(giver.id, 0) >= 5 and _achieve(chat_id, giver.id, "Подхалим генеральский"):
+                        await _announce_achievement(context, chat_id, giver.id, "Подхалим генеральский")
                 else:
-                    _inc(ADMIN_MINUS_GIVEN, giver.id)
-                    if ADMIN_MINUS_GIVEN.get(giver.id, 0) >= 3 and _achieve(giver.id, "Ужалил короля"):
-                        await _announce_achievement(context, update.effective_chat.id, giver.id, "Ужалил короля")
+                    _inc(ADMIN_MINUS_GIVEN[chat_id], giver.id)
+                    if ADMIN_MINUS_GIVEN[chat_id].get(giver.id, 0) >= 3 and _achieve(chat_id, giver.id, "Ужалил короля"):
+                        await _announce_achievement(context, chat_id, giver.id, "Ужалил короля")
         except Exception:
             pass
 
         # большие реп-ачивки для цели
-        total = REP_RECEIVED.get(target_id, 0)
-        if total >= 20 and _achieve(target_id, "Любимчик, сука"):
-            await _announce_achievement(context, update.effective_chat.id, target_id, "Любимчик, сука")
-        if total <= -10 and _achieve(target_id, "Токсик-магнит"):
-            await _announce_achievement(context, update.effective_chat.id, target_id, "Токсик-магнит")
-        if total >= 50 and _achieve(target_id, "Крутой чел"):
-            await _announce_achievement(context, update.effective_chat.id, target_id, "Крутой чел")
-        if total <= -20 and _achieve(target_id, "Опущенный"):
-            await _announce_achievement(context, update.effective_chat.id, target_id, "Опущенный")
+        total = REP_RECEIVED[chat_id].get(target_id, 0)
+        if total >= 20 and _achieve(chat_id, target_id, "Любимчик, сука"):
+            await _announce_achievement(context, chat_id, target_id, "Любимчик, сука")
+        if total <= -10 and _achieve(chat_id, target_id, "Токсик-магнит"):
+            await _announce_achievement(context, chat_id, target_id, "Токсик-магнит")
+        if total >= 50 and _achieve(chat_id, target_id, "Крутой чел"):
+            await _announce_achievement(context, chat_id, target_id, "Крутой чел")
+        if total <= -20 and _achieve(chat_id, target_id, "Опущенный"):
+            await _announce_achievement(context, chat_id, target_id, "Опущенный")
 
         # «Заводила-плюсовик», «Щедрый засранец», «Минусатор-маньяк»
-        total_gives = REP_POS_GIVEN.get(giver.id, 0) + REP_NEG_GIVEN.get(giver.id, 0)
-        if total_gives >= 20 and _achieve(giver.id, "Заводила-плюсовик"):
-            await _announce_achievement(context, update.effective_chat.id, giver.id, "Заводила-плюсовик")
-        if REP_POS_GIVEN.get(giver.id, 0) >= 10 and _achieve(giver.id, "Щедрый засранец"):
-            await _announce_achievement(context, update.effective_chat.id, giver.id, "Щедрый засранец")
-        if REP_NEG_GIVEN.get(giver.id, 0) >= 10 and _achieve(giver.id, "Минусатор-маньяк"):
-            await _announce_achievement(context, update.effective_chat.id, giver.id, "Минусатор-маньяк")
+        total_gives = REP_POS_GIVEN[chat_id].get(giver.id, 0) + REP_NEG_GIVEN[chat_id].get(giver.id, 0)
+        if total_gives >= 20 and _achieve(chat_id, giver.id, "Заводила-плюсовик"):
+            await _announce_achievement(context, chat_id, giver.id, "Заводила-плюсовик")
+        if REP_POS_GIVEN[chat_id].get(giver.id, 0) >= 10 and _achieve(chat_id, giver.id, "Щедрый засранец"):
+            await _announce_achievement(context, chat_id, giver.id, "Щедрый засранец")
+        if REP_NEG_GIVEN[chat_id].get(giver.id, 0) >= 10 and _achieve(chat_id, giver.id, "Минусатор-маньяк"):
+            await _announce_achievement(context, chat_id, giver.id, "Минусатор-маньяк")
 
         sign = "+" if delta > 0 else "-"
         await msg.reply_text(f"{_name_or_id(target_id)} получает {sign}1. Текущая репа: {total}")
@@ -529,126 +777,134 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # === 3) Триггеры ===
     for idx, (pattern, answers) in enumerate(TRIGGERS):
         if pattern.search(t):
-            if _trigger_allowed(update.effective_chat.id):
+            if _trigger_allowed(chat_id):
                 await msg.reply_text(random.choice(answers))
-                _inc(TRIGGER_HITS, uid)
-                # общий триггер-ачив
-                if TRIGGER_HITS.get(uid, 0) >= 15 and _achieve(uid, "Триггер-мейкер"):
-                    await _announce_achievement(context, update.effective_chat.id, uid, "Триггер-мейкер")
-                # пивной
+                _inc(TRIGGER_HITS[chat_id], uid)
+                if TRIGGER_HITS[chat_id].get(uid, 0) >= 15 and _achieve(chat_id, uid, "Триггер-мейкер"):
+                    await _announce_achievement(context, chat_id, uid, "Триггер-мейкер")
                 if idx == 1:
-                    _inc(BEER_HITS, uid)
-                    if BEER_HITS.get(uid, 0) >= 5 and _achieve(uid, "Пивной сомелье-алкаш"):
-                        await _announce_achievement(context, update.effective_chat.id, uid, "Пивной сомелье-алкаш")
-                    if BEER_HITS.get(uid, 0) >= 20 and _achieve(uid, "Пивозавр"):
-                        await _announce_achievement(context, update.effective_chat.id, uid, "Пивозавр")
+                    _inc(BEER_HITS[chat_id], uid)
+                    if BEER_HITS[chat_id].get(uid, 0) >= 5 and _achieve(chat_id, uid, "Пивной сомелье-алкаш"):
+                        await _announce_achievement(context, chat_id, uid, "Пивной сомелье-алкаш")
+                    if BEER_HITS[chat_id].get(uid, 0) >= 20 and _achieve(chat_id, uid, "Пивозавр"):
+                        await _announce_achievement(context, chat_id, uid, "Пивозавр")
             break
 
-    # === 4) NSFW-детект для «Сортирный поэт» ===
+    # === 4) NSFW ===
     if re.compile(r"\b(секс|69|кутёж|жоп|перд|фалл|эрот|порн|xxx|🍑|🍆)\b", re.IGNORECASE).search(t):
-        if _achieve(uid, "Сортирный поэт"):
-            await _announce_achievement(context, update.effective_chat.id, uid, "Сортирный поэт")
+        if _achieve(chat_id, uid, "Сортирный поэт"):
+            await _announce_achievement(context, chat_id, uid, "Сортирный поэт")
 
 # ========= ЭКСПОРТ / ИМПОРТ =========
+async def _ensure_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    chat_id = update.effective_chat.id
+    user_id = update.effective_user.id
+    member = await context.bot.get_chat_member(chat_id, user_id)
+    return member.status in ("administrator", "creator")
+
 async def cmd_export(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message:
         return
-    chat_id = update.effective_chat.id
-    user_id = update.effective_user.id
-    # только админ
-    member = await context.bot.get_chat_member(chat_id, user_id)
-    if member.status not in ("administrator", "creator"):
+    if not await _ensure_admin(update, context):
         await update.message.reply_text("Только админ может делать экспорт 🚫")
         return
 
-    data = {
-        "chat_id": chat_id,
-        "timestamp": datetime.now(UTC).isoformat(),
-        "NICKS": NICKS.get(chat_id, {}),
-        "TAKEN": list(TAKEN.get(chat_id, set())),
-        "LAST_NICK": {str(k): v.isoformat() for k, v in LAST_NICK.items()},
-        "KNOWN": KNOWN,
-        "NAMES": NAMES,
-        "REP_GIVEN": REP_GIVEN,
-        "REP_RECEIVED": REP_RECEIVED,
-        "REP_POS_GIVEN": REP_POS_GIVEN,
-        "REP_NEG_GIVEN": REP_NEG_GIVEN,
-        "REP_GIVE_TIMES": {str(k): [t.isoformat() for t in v] for k, v in REP_GIVE_TIMES.items()},
-        "MSG_COUNT": MSG_COUNT,
-        "CHAR_COUNT": CHAR_COUNT,
-        "NICK_CHANGE_COUNT": NICK_CHANGE_COUNT,
-        "EIGHTBALL_COUNT": EIGHTBALL_COUNT,
-        "TRIGGER_HITS": TRIGGER_HITS,
-        "BEER_HITS": BEER_HITS,
-        "LAST_MSG_AT": {str(k): v.isoformat() for k, v in LAST_MSG_AT.items()},
-        "ADMIN_PLUS_GIVEN": ADMIN_PLUS_GIVEN,
-        "ADMIN_MINUS_GIVEN": ADMIN_MINUS_GIVEN,
-        "ACHIEVEMENTS": {str(uid): list(titles) for uid, titles in ACHIEVEMENTS.items()},
+    data = _serialize_state()
+    fname = f"export_all.json"
+    try:
+        with open(fname, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        await update.message.reply_document(InputFile(fname))
+    finally:
+        try: os.remove(fname)
+        except Exception: pass
+
+async def cmd_export_here(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message:
+        return
+    if not await _ensure_admin(update, context):
+        await update.message.reply_text("Только админ может делать экспорт 🚫")
+        return
+
+    chat_id = update.effective_chat.id
+    snapshot = _serialize_state()
+
+    # вырежем только текущий чат
+    def only_chat(section):
+        return {str(chat_id): section.get(str(chat_id), {})}
+
+    slim = {
+        "NICKS": {str(chat_id): snapshot["NICKS"].get(str(chat_id), {})},
+        "TAKEN": {str(chat_id): snapshot["TAKEN"].get(str(chat_id), [])},
+        "LAST_NICK": snapshot["LAST_NICK"],  # глобально
+        "KNOWN": snapshot["KNOWN"],
+        "NAMES": snapshot["NAMES"],
+
+        "REP_GIVEN": only_chat(snapshot["REP_GIVEN"]),
+        "REP_RECEIVED": only_chat(snapshot["REP_RECEIVED"]),
+        "REP_POS_GIVEN": only_chat(snapshot["REP_POS_GIVEN"]),
+        "REP_NEG_GIVEN": only_chat(snapshot["REP_NEG_GIVEN"]),
+        "REP_GIVE_TIMES": only_chat(snapshot["REP_GIVE_TIMES"]),
+
+        "MSG_COUNT": only_chat(snapshot["MSG_COUNT"]),
+        "CHAR_COUNT": only_chat(snapshot["CHAR_COUNT"]),
+        "NICK_CHANGE_COUNT": only_chat(snapshot["NICK_CHANGE_COUNT"]),
+        "EIGHTBALL_COUNT": only_chat(snapshot["EIGHTBALL_COUNT"]),
+        "TRIGGER_HITS": only_chat(snapshot["TRIGGER_HITS"]),
+        "BEER_HITS": only_chat(snapshot["BEER_HITS"]),
+        "LAST_MSG_AT": only_chat(snapshot["LAST_MSG_AT"]),
+
+        "ADMIN_PLUS_GIVEN": only_chat(snapshot["ADMIN_PLUS_GIVEN"]),
+        "ADMIN_MINUS_GIVEN": only_chat(snapshot["ADMIN_MINUS_GIVEN"]),
+        "ACHIEVEMENTS": only_chat(snapshot["ACHIEVEMENTS"]),
     }
 
-    fname = f"export_{chat_id}.json"
-    with open(fname, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
-    await update.message.reply_document(InputFile(fname))
+    fname = f"export_chat_{chat_id}.json"
     try:
-        os.remove(fname)
-    except Exception:
-        pass
+        with open(fname, "w", encoding="utf-8") as f:
+            json.dump(slim, f, ensure_ascii=False, indent=2)
+        await update.message.reply_document(InputFile(fname))
+    finally:
+        try: os.remove(fname)
+        except Exception: pass
 
 async def cmd_import(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.message.document:
         await update.message.reply_text("Прикрепи JSON-файл с экспортом.")
         return
-    chat_id = update.effective_chat.id
-    user_id = update.effective_user.id
-    # только админ
-    member = await context.bot.get_chat_member(chat_id, user_id)
-    if member.status not in ("administrator", "creator"):
+    if not await _ensure_admin(update, context):
         await update.message.reply_text("Только админ может делать импорт 🚫")
         return
 
-    file = await context.bot.get_file(update.message.document)
-    path = f"import_{chat_id}.json"
-    await file.download_to_drive(path)
-
-    with open(path, "r", encoding="utf-8") as f:
-        data = json.load(f)
-
-    # мягкое мёрдж-восстановление (только этого чата где нужно)
-    NICKS[chat_id] = {int(k): v for k, v in data.get("NICKS", {}).items()}
-    TAKEN[chat_id] = set(data.get("TAKEN", []))
-    LAST_NICK.clear()
-    LAST_NICK.update({int(k): datetime.fromisoformat(v) for k, v in data.get("LAST_NICK", {}).items()})
-    KNOWN.clear(); KNOWN.update({k: int(v) for k, v in data.get("KNOWN", {}).items()})
-    NAMES.clear(); NAMES.update({int(k): v for k, v in data.get("NAMES", {}).items()})
-    for d, src in [
-        (REP_GIVEN, "REP_GIVEN"), (REP_RECEIVED, "REP_RECEIVED"),
-        (REP_POS_GIVEN, "REP_POS_GIVEN"), (REP_NEG_GIVEN, "REP_NEG_GIVEN"),
-        (MSG_COUNT, "MSG_COUNT"), (CHAR_COUNT, "CHAR_COUNT"),
-        (NICK_CHANGE_COUNT, "NICK_CHANGE_COUNT"),
-        (EIGHTBALL_COUNT, "EIGHTBALL_COUNT"),
-        (TRIGGER_HITS, "TRIGGER_HITS"), (BEER_HITS, "BEER_HITS"),
-        (ADMIN_PLUS_GIVEN, "ADMIN_PLUS_GIVEN"), (ADMIN_MINUS_GIVEN, "ADMIN_MINUS_GIVEN"),
-    ]:
-        d.clear(); d.update({int(k): int(v) for k, v in data.get(src, {}).items()})
-    REP_GIVE_TIMES.clear()
-    REP_GIVE_TIMES.update({int(k): [datetime.fromisoformat(t) for t in v] for k, v in data.get("REP_GIVE_TIMES", {}).items()})
-    LAST_MSG_AT.clear()
-    LAST_MSG_AT.update({int(k): datetime.fromisoformat(v) for k, v in data.get("LAST_MSG_AT", {}).items()})
-    ACHIEVEMENTS.clear()
-    ACHIEVEMENTS.update({int(uid): set(titles) for uid, titles in data.get("ACHIEVEMENTS", {}).items()})
-
+    chat_id = update.effective_chat.id
     try:
-        os.remove(path)
-    except Exception:
-        pass
+        file = await context.bot.get_file(update.message.document)
+        path = f"import_{chat_id}.json"
+        await file.download_to_drive(path)
 
-    await update.message.reply_text("Импорт завершён ✅")
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+
+        async with STATE_LOCK:
+            # Мягкий импорт: заливаем ТОЛЬКО текущий чат
+            _apply_state(data, target_chat_id=chat_id, only_this_chat=True)
+
+        await update.message.reply_text("Импорт завершён ✅ (только текущий чат)")
+    except json.JSONDecodeError:
+        await update.message.reply_text("Файл не похож на валидный JSON ❌")
+    except Exception as e:
+        await update.message.reply_text(f"Не удалось импортировать: {type(e).__name__}")
+    finally:
+        try: os.remove(path)
+        except Exception: pass
 
 # ========= СТАТИСТИКА =========
 def build_stats_text(chat_id: int) -> str:
+    def top10(d: Dict[int, int]) -> List[Tuple[int, int]]:
+        return sorted(d.items(), key=lambda x: x[1], reverse=True)[:10]
+
     # Топ-10 репутации (по полученной)
-    top = sorted(REP_RECEIVED.items(), key=lambda x: x[1], reverse=True)[:10]
+    top = top10(REP_RECEIVED.get(chat_id, {}))
     top_lines = [f"• {_name_or_id(uid)}: {score}" for uid, score in top] or ["• пока пусто"]
 
     # Текущие ники (по чату)
@@ -656,13 +912,13 @@ def build_stats_text(chat_id: int) -> str:
     nick_lines = [f"• {_name_or_id(uid)}: {nick}" for uid, nick in nick_items.items()] or ["• пока никому не присвоено"]
 
     # Топ-10 по сообщениям
-    top_msg = sorted(MSG_COUNT.items(), key=lambda x: x[1], reverse=True)[:10]
-    msg_lines = [f"• {_name_or_id(uid)}: {cnt} смс / {CHAR_COUNT.get(uid,0)} симв."
+    top_msg = top10(MSG_COUNT.get(chat_id, {}))
+    msg_lines = [f"• {_name_or_id(uid)}: {cnt} смс / {CHAR_COUNT.get(chat_id, {}).get(uid,0)} симв."
                  for uid, cnt in top_msg] or ["• пока пусто"]
 
-    # Ачивки по людям (все, у кого они есть)
+    # Ачивки (только те, у кого они есть)
     ach_lines = []
-    for uid, titles in ACHIEVEMENTS.items():
+    for uid, titles in ACHIEVEMENTS.get(chat_id, {}).items():
         if not titles:
             continue
         title_list = ", ".join(sorted(titles))
@@ -672,7 +928,7 @@ def build_stats_text(chat_id: int) -> str:
 
     return (
         f"{STATS_TITLE}\n\n"
-        "🏆 Топ-10 по репутации:\n" + "\n".join(top_lines) + "\n\n"
+        "🏆 Топ-10 по репутации (этот чат):\n" + "\n".join(top_lines) + "\n\n"
         "📝 Текущие ники:\n" + "\n".join(nick_lines) + "\n\n"
         "⌨️ Топ-10 по активности:\n" + "\n".join(msg_lines) + "\n\n"
         "🏅 Ачивки участников:\n" + "\n".join(ach_lines)
@@ -680,28 +936,54 @@ def build_stats_text(chat_id: int) -> str:
 
 # ========= HEALTH для Render =========
 app = Flask(__name__)
+
 @app.get("/")
-def health():
+def root():
     return "Bot is running!"
+
+@app.get("/health")
+def health():
+    return "ok"
+
+@app.get("/healthz")
+def healthz():
+    return "ok"
 
 def run_flask():
     port = int(os.getenv("PORT", 5000))
-    app.run(host="0.0.0.0", port=port)
+    # threaded=True — быстрее отдаёт health-check; use_reloader=False — не плодим процессы
+    app.run(host="0.0.0.0", port=port, threaded=True, use_reloader=False)
+
+# ========= JOBS =========
+async def periodic_save_job(context: ContextTypes.DEFAULT_TYPE):
+    async with STATE_LOCK:
+        await cloud_save()
+
+async def keepalive_job(context: ContextTypes.DEFAULT_TYPE):
+    if not SELF_URL:
+        return
+    try:
+        async with httpx.AsyncClient(timeout=8.0) as client:
+            await client.get(SELF_URL)
+    except Exception:
+        pass
 
 # ========= ENTRY =========
 async def _pre_init(app: Application):
-    # на всякий: удаляем возможный webhook
+    # чистим возможный webhook
     try:
         await app.bot.delete_webhook(drop_pending_updates=True)
     except Exception:
         pass
+    # загрузим состояние из облака/локального бэкапа
+    await cloud_load_if_any()
 
 def main():
-    # маленький веб-сервер: Render любит, когда кто-то слушает порт
+    # маленький веб-сервер для Render
     threading.Thread(target=run_flask, daemon=True).start()
 
-    # «тихие» таймауты для polling (меньше конфликтов на free)
-    req = HTTPXRequest(connect_timeout=10.0, read_timeout=25.0, pool_timeout=5.0)
+    # «тихие» таймауты для polling
+    req = HTTPXRequest(connect_timeout=8.0, read_timeout=20.0, pool_timeout=5.0)
 
     application: Application = (
         ApplicationBuilder()
@@ -717,6 +999,7 @@ def main():
     application.add_handler(CommandHandler("nick",  cmd_nick))
     application.add_handler(CommandHandler("8ball", cmd_8ball))
     application.add_handler(CommandHandler("export", cmd_export))
+    application.add_handler(CommandHandler("export_here", cmd_export_here))
     application.add_handler(CommandHandler("import", cmd_import))
 
     # Кнопки
@@ -725,11 +1008,16 @@ def main():
     # ЕДИНЫЙ обработчик текстов (не команд)
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
 
+    # Периодические задачи: автосейв и keep-alive
+    jq = application.job_queue
+    jq.run_repeating(periodic_save_job, interval=300, first=120)   # каждые 5 минут
+    jq.run_repeating(keepalive_job,     interval=240, first=60)    # самопинг раз в 4 минуты
+
     # Запуск polling
     from telegram import Update as TgUpdate
     application.run_polling(
         allowed_updates=TgUpdate.ALL_TYPES,
-        timeout=25,
+        timeout=20,
         poll_interval=1.0,
         drop_pending_updates=True,
         close_loop=False,
