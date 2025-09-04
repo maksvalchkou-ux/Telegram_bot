@@ -3,11 +3,12 @@ import re
 import random
 import threading
 import html
+import json
 from datetime import datetime, timedelta, timezone
 from typing import Dict, Optional, Set, Tuple, List
 
 from flask import Flask
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, User
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, User, InputFile
 from telegram.ext import (
     Application, ApplicationBuilder, CommandHandler, CallbackQueryHandler,
     MessageHandler, ContextTypes, filters
@@ -19,8 +20,8 @@ API_TOKEN = os.getenv("BOT_TOKEN")
 if not API_TOKEN:
     raise RuntimeError("BOT_TOKEN is not set")
 
-# Кулдаун на генерацию никнейма инициатором (можно поднять до часа)
-NICK_COOLDOWN = timedelta(seconds=10)
+# Кулдаун на генерацию никнейма инициатором (1 час)
+NICK_COOLDOWN = timedelta(hours=1)
 # Антиспам для авто-триггеров (на чат)
 TRIGGER_COOLDOWN = timedelta(seconds=20)
 # Лимит репутации: сколько выдач (+/-) один пользователь может сделать за 24 часа
@@ -34,12 +35,14 @@ WELCOME_TEXT = (
     "Жми кнопки ниже — там памятка и статистика."
 )
 HELP_TEXT = (
-    "🛠 Что умеет этот бот:\n"
+    "🛠 Команды:\n"
     "• /start — открыть меню\n"
     "• /nick — ник себе; /nick @user или ответом — ник другу\n"
     "• /8ball вопрос — магический шар отвечает\n"
     "• +1 / -1 — репутация по реплаю или с @username\n"
-    "• «📊 Статистика» — топ репы, текущие ники, активность и ачивки\n"
+    "• «📊 Статистика» — топ-10 репы, ники, активность и ачивки\n"
+    "• /export — сохранить данные (только админ)\n"
+    "• /import — восстановить данные (только админ)\n"
 )
 STATS_TITLE = "📊 Статистика"
 
@@ -84,8 +87,8 @@ BEER_HITS: Dict[int, int] = {}            # user_id -> сколько раз с�
 LAST_MSG_AT: Dict[int, datetime] = {}     # user_id -> последний момент, когда писал
 
 # — админ-взаимодействия
-ADMIN_PLUS_GIVEN: Dict[int, int] = {}     # user_id -> сколько раз +1 админам
-ADMIN_MINUS_GIVEN: Dict[int, int] = {}    # user_id -> сколько раз -1 админам
+ADMIN_PLUS_GIVEN: Dict[int, int] = {}     # user_id -> сколько раз поставил +1 админам
+ADMIN_MINUS_GIVEN: Dict[int, int] = {}    # user_id -> сколько раз поставил -1 админам
 
 # — ачивки
 ACHIEVEMENTS: Dict[int, Set[str]] = {}    # user_id -> set(title)
@@ -294,7 +297,7 @@ async def cmd_nick(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await _remember_user(update.effective_user)
 
     chat_id = update.effective_chat.id
-    _ensure_chat(chat_id)  # важно: гарантируем структуры под чат
+    _ensure_chat(chat_id)
 
     initiator = update.effective_user
 
@@ -546,18 +549,114 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if _achieve(uid, "Сортирный поэт"):
             await _announce_achievement(context, update.effective_chat.id, uid, "Сортирный поэт")
 
+# ========= ЭКСПОРТ / ИМПОРТ =========
+async def cmd_export(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message:
+        return
+    chat_id = update.effective_chat.id
+    user_id = update.effective_user.id
+    # только админ
+    member = await context.bot.get_chat_member(chat_id, user_id)
+    if member.status not in ("administrator", "creator"):
+        await update.message.reply_text("Только админ может делать экспорт 🚫")
+        return
+
+    data = {
+        "chat_id": chat_id,
+        "timestamp": datetime.now(UTC).isoformat(),
+        "NICKS": NICKS.get(chat_id, {}),
+        "TAKEN": list(TAKEN.get(chat_id, set())),
+        "LAST_NICK": {str(k): v.isoformat() for k, v in LAST_NICK.items()},
+        "KNOWN": KNOWN,
+        "NAMES": NAMES,
+        "REP_GIVEN": REP_GIVEN,
+        "REP_RECEIVED": REP_RECEIVED,
+        "REP_POS_GIVEN": REP_POS_GIVEN,
+        "REP_NEG_GIVEN": REP_NEG_GIVEN,
+        "REP_GIVE_TIMES": {str(k): [t.isoformat() for t in v] for k, v in REP_GIVE_TIMES.items()},
+        "MSG_COUNT": MSG_COUNT,
+        "CHAR_COUNT": CHAR_COUNT,
+        "NICK_CHANGE_COUNT": NICK_CHANGE_COUNT,
+        "EIGHTBALL_COUNT": EIGHTBALL_COUNT,
+        "TRIGGER_HITS": TRIGGER_HITS,
+        "BEER_HITS": BEER_HITS,
+        "LAST_MSG_AT": {str(k): v.isoformat() for k, v in LAST_MSG_AT.items()},
+        "ADMIN_PLUS_GIVEN": ADMIN_PLUS_GIVEN,
+        "ADMIN_MINUS_GIVEN": ADMIN_MINUS_GIVEN,
+        "ACHIEVEMENTS": {str(uid): list(titles) for uid, titles in ACHIEVEMENTS.items()},
+    }
+
+    fname = f"export_{chat_id}.json"
+    with open(fname, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+    await update.message.reply_document(InputFile(fname))
+    try:
+        os.remove(fname)
+    except Exception:
+        pass
+
+async def cmd_import(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message or not update.message.document:
+        await update.message.reply_text("Прикрепи JSON-файл с экспортом.")
+        return
+    chat_id = update.effective_chat.id
+    user_id = update.effective_user.id
+    # только админ
+    member = await context.bot.get_chat_member(chat_id, user_id)
+    if member.status not in ("administrator", "creator"):
+        await update.message.reply_text("Только админ может делать импорт 🚫")
+        return
+
+    file = await context.bot.get_file(update.message.document)
+    path = f"import_{chat_id}.json"
+    await file.download_to_drive(path)
+
+    with open(path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+
+    # мягкое мёрдж-восстановление (только этого чата где нужно)
+    NICKS[chat_id] = {int(k): v for k, v in data.get("NICKS", {}).items()}
+    TAKEN[chat_id] = set(data.get("TAKEN", []))
+    LAST_NICK.clear()
+    LAST_NICK.update({int(k): datetime.fromisoformat(v) for k, v in data.get("LAST_NICK", {}).items()})
+    KNOWN.clear(); KNOWN.update({k: int(v) for k, v in data.get("KNOWN", {}).items()})
+    NAMES.clear(); NAMES.update({int(k): v for k, v in data.get("NAMES", {}).items()})
+    for d, src in [
+        (REP_GIVEN, "REP_GIVEN"), (REP_RECEIVED, "REP_RECEIVED"),
+        (REP_POS_GIVEN, "REP_POS_GIVEN"), (REP_NEG_GIVEN, "REP_NEG_GIVEN"),
+        (MSG_COUNT, "MSG_COUNT"), (CHAR_COUNT, "CHAR_COUNT"),
+        (NICK_CHANGE_COUNT, "NICK_CHANGE_COUNT"),
+        (EIGHTBALL_COUNT, "EIGHTBALL_COUNT"),
+        (TRIGGER_HITS, "TRIGGER_HITS"), (BEER_HITS, "BEER_HITS"),
+        (ADMIN_PLUS_GIVEN, "ADMIN_PLUS_GIVEN"), (ADMIN_MINUS_GIVEN, "ADMIN_MINUS_GIVEN"),
+    ]:
+        d.clear(); d.update({int(k): int(v) for k, v in data.get(src, {}).items()})
+    REP_GIVE_TIMES.clear()
+    REP_GIVE_TIMES.update({int(k): [datetime.fromisoformat(t) for t in v] for k, v in data.get("REP_GIVE_TIMES", {}).items()})
+    LAST_MSG_AT.clear()
+    LAST_MSG_AT.update({int(k): datetime.fromisoformat(v) for k, v in data.get("LAST_MSG_AT", {}).items()})
+    ACHIEVEMENTS.clear()
+    ACHIEVEMENTS.update({int(uid): set(titles) for uid, titles in data.get("ACHIEVEMENTS", {}).items()})
+
+    try:
+        os.remove(path)
+    except Exception:
+        pass
+
+    await update.message.reply_text("Импорт завершён ✅")
+
 # ========= СТАТИСТИКА =========
 def build_stats_text(chat_id: int) -> str:
-    # Топ по полученной репутации (3 места)
-    top = sorted(REP_RECEIVED.items(), key=lambda x: x[1], reverse=True)[:3]
+    # Топ-10 репутации (по полученной)
+    top = sorted(REP_RECEIVED.items(), key=lambda x: x[1], reverse=True)[:10]
     top_lines = [f"• {_name_or_id(uid)}: {score}" for uid, score in top] or ["• пока пусто"]
 
     # Текущие ники (по чату)
     nick_items = NICKS.get(chat_id, {})
     nick_lines = [f"• {_name_or_id(uid)}: {nick}" for uid, nick in nick_items.items()] or ["• пока никому не присвоено"]
 
-    # Активность (топ-3 по сообщениям)
-    top_msg = sorted(MSG_COUNT.items(), key=lambda x: x[1], reverse=True)[:3]
+    # Топ-10 по сообщениям
+    top_msg = sorted(MSG_COUNT.items(), key=lambda x: x[1], reverse=True)[:10]
     msg_lines = [f"• {_name_or_id(uid)}: {cnt} смс / {CHAR_COUNT.get(uid,0)} симв."
                  for uid, cnt in top_msg] or ["• пока пусто"]
 
@@ -573,9 +672,9 @@ def build_stats_text(chat_id: int) -> str:
 
     return (
         f"{STATS_TITLE}\n\n"
-        "🏆 Топ по репутации:\n" + "\n".join(top_lines) + "\n\n"
+        "🏆 Топ-10 по репутации:\n" + "\n".join(top_lines) + "\n\n"
         "📝 Текущие ники:\n" + "\n".join(nick_lines) + "\n\n"
-        "⌨️ Активность:\n" + "\n".join(msg_lines) + "\n\n"
+        "⌨️ Топ-10 по активности:\n" + "\n".join(msg_lines) + "\n\n"
         "🏅 Ачивки участников:\n" + "\n".join(ach_lines)
     )
 
@@ -617,6 +716,8 @@ def main():
     application.add_handler(CommandHandler("help",  cmd_help))
     application.add_handler(CommandHandler("nick",  cmd_nick))
     application.add_handler(CommandHandler("8ball", cmd_8ball))
+    application.add_handler(CommandHandler("export", cmd_export))
+    application.add_handler(CommandHandler("import", cmd_import))
 
     # Кнопки
     application.add_handler(CallbackQueryHandler(on_button))
