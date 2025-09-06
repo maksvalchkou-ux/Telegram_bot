@@ -58,6 +58,8 @@ HELP_TEXT = (
     "• /export — сохранить ВСЮ базу (все чаты) (только админ)\n"
     "• /export_here — сохранить только текущий чат (только админ)\n"
     "• /import — восстановить ТЕКУЩИЙ чат из файла (только админ)\n"
+    "• /reset — СБРОСИТЬ ВСЮ историю ТЕКУЩЕГО чата (только админ)\n"
+    "• /resetuser @user (или по реплаю) — СБРОСИТЬ историю указанного участника (только админ)\n"
 )
 STATS_TITLE = "📊 Статистика"
 
@@ -137,7 +139,7 @@ ACH_LIST: Dict[str, Tuple[str, str]] = {
     "Тронолом":             ("менял ник админа",                          "Сменил ник пользователю-админу."),
     "Подхалим генеральский":("поставил +1 админу 5 раз",                  "Выдал +1 админам ≥ 5."),
     "Ужалил короля":        ("влепил -1 админам 3 раза",                  "Выдал -1 админам ≥ 3."),
-    "Крутой чел":           ("накопил солидную репу",                     "Полученная репутация ≥ 50."),
+    "Крутой чел":           ("накопил солидную репу",                     "Полученная репа ≥ 50."),
     "Опущенный":            ("опустился по репутации ниже плинтуса",      "Полученная репа ≤ -20."),
     "Пошёл смотреть коров": ("пропадал 5 дней",                           "Перерыв ≥ 5 дней."),
     "Споткнулся о ***":     ("пропадал 3 дня",                            "Перерыв ≥ 3 дня."),
@@ -309,42 +311,35 @@ def _name_or_id(uid: int) -> str:
 
 # ========= ПЕРСИСТЕНТНОСТЬ =========
 def _serialize_state() -> dict:
-    def conv_nested_datetime(dct):
-        # конвертируем datetime в iso по всем слоям где нужно
-        return {
-            str(k): {str(kk): vv.isoformat() for kk, vv in v.items()}
-            for k, v in dct.items()
-        }
-
     return {
-        "NICKS": NICKS,
+        "NICKS": {str(cid): {str(uid): nick for uid, nick in per.items()} for cid, per in NICKS.items()},
         "TAKEN": {str(cid): list(vals) for cid, vals in TAKEN.items()},
         "LAST_NICK": {str(k): v.isoformat() for k, v in LAST_NICK.items()},
         "KNOWN": KNOWN,
-        "NAMES": NAMES,
+        "NAMES": {str(k): v for k, v in NAMES.items()},
 
-        "REP_GIVEN": REP_GIVEN,
-        "REP_RECEIVED": REP_RECEIVED,
-        "REP_POS_GIVEN": REP_POS_GIVEN,
-        "REP_NEG_GIVEN": REP_NEG_GIVEN,
+        "REP_GIVEN": {str(cid): {str(uid): int(v) for uid, v in per.items()} for cid, per in REP_GIVEN.items()},
+        "REP_RECEIVED": {str(cid): {str(uid): int(v) for uid, v in per.items()} for cid, per in REP_RECEIVED.items()},
+        "REP_POS_GIVEN": {str(cid): {str(uid): int(v) for uid, v in per.items()} for cid, per in REP_POS_GIVEN.items()},
+        "REP_NEG_GIVEN": {str(cid): {str(uid): int(v) for uid, v in per.items()} for cid, per in REP_NEG_GIVEN.items()},
         "REP_GIVE_TIMES": {
             str(cid): {str(uid): [t.isoformat() for t in arr] for uid, arr in per.items()}
             for cid, per in REP_GIVE_TIMES.items()
         },
 
-        "MSG_COUNT": MSG_COUNT,
-        "CHAR_COUNT": CHAR_COUNT,
-        "NICK_CHANGE_COUNT": NICK_CHANGE_COUNT,
-        "EIGHTBALL_COUNT": EIGHTBALL_COUNT,
-        "TRIGGER_HITS": TRIGGER_HITS,
-        "BEER_HITS": BEER_HITS,
+        "MSG_COUNT": {str(cid): {str(uid): int(v) for uid, v in per.items()} for cid, per in MSG_COUNT.items()},
+        "CHAR_COUNT": {str(cid): {str(uid): int(v) for uid, v in per.items()} for cid, per in CHAR_COUNT.items()},
+        "NICK_CHANGE_COUNT": {str(cid): {str(uid): int(v) for uid, v in per.items()} for cid, per in NICK_CHANGE_COUNT.items()},
+        "EIGHTBALL_COUNT": {str(cid): {str(uid): int(v) for uid, v in per.items()} for cid, per in EIGHTBALL_COUNT.items()},
+        "TRIGGER_HITS": {str(cid): {str(uid): int(v) for uid, v in per.items()} for cid, per in TRIGGER_HITS.items()},
+        "BEER_HITS": {str(cid): {str(uid): int(v) for uid, v in per.items()} for cid, per in BEER_HITS.items()},
         "LAST_MSG_AT": {
             str(cid): {str(uid): dt.isoformat() for uid, dt in per.items()}
             for cid, per in LAST_MSG_AT.items()
         },
 
-        "ADMIN_PLUS_GIVEN": ADMIN_PLUS_GIVEN,
-        "ADMIN_MINUS_GIVEN": ADMIN_MINUS_GIVEN,
+        "ADMIN_PLUS_GIVEN": {str(cid): {str(uid): int(v) for uid, v in per.items()} for cid, per in ADMIN_PLUS_GIVEN.items()},
+        "ADMIN_MINUS_GIVEN": {str(cid): {str(uid): int(v) for uid, v in per.items()} for cid, per in ADMIN_MINUS_GIVEN.items()},
         "ACHIEVEMENTS": {
             str(cid): {str(uid): list(titles) for uid, titles in per.items()}
             for cid, per in ACHIEVEMENTS.items()
@@ -352,95 +347,72 @@ def _serialize_state() -> dict:
     }
 
 def _apply_state(data: dict, target_chat_id: Optional[int] = None, only_this_chat: bool = False):
-    """
-    если target_chat_id и only_this_chat=True — импортируем ТОЛЬКО секцию этого чата (merge).
-    если only_this_chat=False — грузим всё как есть (глобальный импорт/восстановление).
-    """
-
-    def to_int_dict(d):
-        return {int(k): v for k, v in d.items()}
-
-    def to_nested_int_dict(d):
-        return {int(k): {int(kk): vv for kk, vv in v.items()} for k, v in d.items()}
-
-    # helper для LAST_* и дат
     def parse_dt(s): return datetime.fromisoformat(s)
 
     if only_this_chat and target_chat_id is not None:
         cid = str(target_chat_id)
+        def get_map(key): return {int(uid): v for uid, v in data.get(key, {}).get(cid, {}).items()}
+        def get_map_i(key): return {int(uid): int(v) for uid, v in data.get(key, {}).get(cid, {}).items()}
 
-        # пер-чатные секции
-        for store, key, caster in [
-            (NICKS, "NICKS", lambda x: {int(uid): nick for uid, nick in x.get(cid, {}).items()}),
-            (TAKEN, "TAKEN", lambda x: set(x.get(cid, []))),
-            (REP_GIVEN, "REP_GIVEN", lambda x: {int(uid): int(v) for uid, v in x.get(cid, {}).items()}),
-            (REP_RECEIVED, "REP_RECEIVED", lambda x: {int(uid): int(v) for uid, v in x.get(cid, {}).items()}),
-            (REP_POS_GIVEN, "REP_POS_GIVEN", lambda x: {int(uid): int(v) for uid, v in x.get(cid, {}).items()}),
-            (REP_NEG_GIVEN, "REP_NEG_GIVEN", lambda x: {int(uid): int(v) for uid, v in x.get(cid, {}).items()}),
-            (MSG_COUNT, "MSG_COUNT", lambda x: {int(uid): int(v) for uid, v in x.get(cid, {}).items()}),
-            (CHAR_COUNT, "CHAR_COUNT", lambda x: {int(uid): int(v) for uid, v in x.get(cid, {}).items()}),
-            (NICK_CHANGE_COUNT, "NICK_CHANGE_COUNT", lambda x: {int(uid): int(v) for uid, v in x.get(cid, {}).items()}),
-            (EIGHTBALL_COUNT, "EIGHTBALL_COUNT", lambda x: {int(uid): int(v) for uid, v in x.get(cid, {}).items()}),
-            (TRIGGER_HITS, "TRIGGER_HITS", lambda x: {int(uid): int(v) for uid, v in x.get(cid, {}).items()}),
-            (BEER_HITS, "BEER_HITS", lambda x: {int(uid): int(v) for uid, v in x.get(cid, {}).items()}),
-            (ADMIN_PLUS_GIVEN, "ADMIN_PLUS_GIVEN", lambda x: {int(uid): int(v) for uid, v in x.get(cid, {}).items()}),
-            (ADMIN_MINUS_GIVEN, "ADMIN_MINUS_GIVEN", lambda x: {int(uid): int(v) for uid, v in x.get(cid, {}).items()}),
-        ]:
-            store[target_chat_id] = caster(data.get(key, {}))
+        NICKS[target_chat_id] = get_map("NICKS")
+        TAKEN[target_chat_id] = set(data.get("TAKEN", {}).get(cid, []))
 
-        # даты
-        last_msg_src = data.get("LAST_MSG_AT", {}).get(cid, {})
-        LAST_MSG_AT[target_chat_id] = {int(uid): parse_dt(v) for uid, v in last_msg_src.items()}
+        REP_GIVEN[target_chat_id] = get_map_i("REP_GIVEN")
+        REP_RECEIVED[target_chat_id] = get_map_i("REP_RECEIVED")
+        REP_POS_GIVEN[target_chat_id] = get_map_i("REP_POS_GIVEN")
+        REP_NEG_GIVEN[target_chat_id] = get_map_i("REP_NEG_GIVEN")
 
-        rep_times_src = data.get("REP_GIVE_TIMES", {}).get(cid, {})
-        REP_GIVE_TIMES[target_chat_id] = {int(uid): [parse_dt(t) for t in arr] for uid, arr in rep_times_src.items()}
+        MSG_COUNT[target_chat_id] = get_map_i("MSG_COUNT")
+        CHAR_COUNT[target_chat_id] = get_map_i("CHAR_COUNT")
+        NICK_CHANGE_COUNT[target_chat_id] = get_map_i("NICK_CHANGE_COUNT")
+        EIGHTBALL_COUNT[target_chat_id] = get_map_i("EIGHTBALL_COUNT")
+        TRIGGER_HITS[target_chat_id] = get_map_i("TRIGGER_HITS")
+        BEER_HITS[target_chat_id] = get_map_i("BEER_HITS")
+        ADMIN_PLUS_GIVEN[target_chat_id] = get_map_i("ADMIN_PLUS_GIVEN")
+        ADMIN_MINUS_GIVEN[target_chat_id] = get_map_i("ADMIN_MINUS_GIVEN")
 
-        ach_src = data.get("ACHIEVEMENTS", {}).get(cid, {})
-        ACHIEVEMENTS[target_chat_id] = {int(uid): set(titles) for uid, titles in ach_src.items()}
-
-        # глобальные справочники не трогаем при /import_here
+        LAST_MSG_AT[target_chat_id] = {int(uid): parse_dt(v) for uid, v in data.get("LAST_MSG_AT", {}).get(cid, {}).items()}
+        REP_GIVE_TIMES[target_chat_id] = {int(uid): [parse_dt(t) for t in arr]
+                                          for uid, arr in data.get("REP_GIVE_TIMES", {}).get(cid, {}).items()}
+        ACHIEVEMENTS[target_chat_id] = {int(uid): set(titles) for uid, titles in data.get("ACHIEVEMENTS", {}).get(cid, {}).items()}
         return
 
-    # иначе — грузим весь слепок
-    NICKS.clear(); NICKS.update(to_nested_int_dict(data.get("NICKS", {})))
+    # полный импорт
+    def nested_int_map(obj): return {int(cid): {int(uid): v for uid, v in per.items()} for cid, per in obj.items()}
+    def nested_int_map_i(obj): return {int(cid): {int(uid): int(v) for uid, v in per.items()} for cid, per in obj.items()}
+
+    NICKS.clear(); NICKS.update(nested_int_map(data.get("NICKS", {})))
     TAKEN.clear(); TAKEN.update({int(cid): set(vals) for cid, vals in data.get("TAKEN", {}).items()})
     LAST_NICK.clear(); LAST_NICK.update({int(k): parse_dt(v) for k, v in data.get("LAST_NICK", {}).items()})
     KNOWN.clear(); KNOWN.update({k: int(v) for k, v in data.get("KNOWN", {}).items()})
     NAMES.clear(); NAMES.update({int(k): v for k, v in data.get("NAMES", {}).items()})
 
-    def load_int2int_nested(key):
-        return to_nested_int_dict({cid: {uid: int(val) for uid, val in per.items()}
-                                   for cid, per in data.get(key, {}).items()})
-
-    REP_GIVEN.clear(); REP_GIVEN.update(load_int2int_nested("REP_GIVEN"))
-    REP_RECEIVED.clear(); REP_RECEIVED.update(load_int2int_nested("REP_RECEIVED"))
-    REP_POS_GIVEN.clear(); REP_POS_GIVEN.update(load_int2int_nested("REP_POS_GIVEN"))
-    REP_NEG_GIVEN.clear(); REP_NEG_GIVEN.update(load_int2int_nested("REP_NEG_GIVEN"))
+    REP_GIVEN.clear(); REP_GIVEN.update(nested_int_map_i(data.get("REP_GIVEN", {})))
+    REP_RECEIVED.clear(); REP_RECEIVED.update(nested_int_map_i(data.get("REP_RECEIVED", {})))
+    REP_POS_GIVEN.clear(); REP_POS_GIVEN.update(nested_int_map_i(data.get("REP_POS_GIVEN", {})))
+    REP_NEG_GIVEN.clear(); REP_NEG_GIVEN.update(nested_int_map_i(data.get("REP_NEG_GIVEN", {})))
 
     REP_GIVE_TIMES.clear()
     for cid, per in data.get("REP_GIVE_TIMES", {}).items():
-        cid_i = int(cid)
-        REP_GIVE_TIMES[cid_i] = {int(uid): [parse_dt(t) for t in arr] for uid, arr in per.items()}
+        REP_GIVE_TIMES[int(cid)] = {int(uid): [parse_dt(t) for t in arr] for uid, arr in per.items()}
 
-    MSG_COUNT.clear(); MSG_COUNT.update(load_int2int_nested("MSG_COUNT"))
-    CHAR_COUNT.clear(); CHAR_COUNT.update(load_int2int_nested("CHAR_COUNT"))
-    NICK_CHANGE_COUNT.clear(); NICK_CHANGE_COUNT.update(load_int2int_nested("NICK_CHANGE_COUNT"))
-    EIGHTBALL_COUNT.clear(); EIGHTBALL_COUNT.update(load_int2int_nested("EIGHTBALL_COUNT"))
-    TRIGGER_HITS.clear(); TRIGGER_HITS.update(load_int2int_nested("TRIGGER_HITS"))
-    BEER_HITS.clear(); BEER_HITS.update(load_int2int_nested("BEER_HITS"))
+    MSG_COUNT.clear(); MSG_COUNT.update(nested_int_map_i(data.get("MSG_COUNT", {})))
+    CHAR_COUNT.clear(); CHAR_COUNT.update(nested_int_map_i(data.get("CHAR_COUNT", {})))
+    NICK_CHANGE_COUNT.clear(); NICK_CHANGE_COUNT.update(nested_int_map_i(data.get("NICK_CHANGE_COUNT", {})))
+    EIGHTBALL_COUNT.clear(); EIGHTBALL_COUNT.update(nested_int_map_i(data.get("EIGHTBALL_COUNT", {})))
+    TRIGGER_HITS.clear(); TRIGGER_HITS.update(nested_int_map_i(data.get("TRIGGER_HITS", {})))
+    BEER_HITS.clear(); BEER_HITS.update(nested_int_map_i(data.get("BEER_HITS", {})))
 
     LAST_MSG_AT.clear()
     for cid, per in data.get("LAST_MSG_AT", {}).items():
-        cid_i = int(cid)
-        LAST_MSG_AT[cid_i] = {int(uid): parse_dt(v) for uid, v in per.items()}
+        LAST_MSG_AT[int(cid)] = {int(uid): parse_dt(v) for uid, v in per.items()}
 
-    ADMIN_PLUS_GIVEN.clear(); ADMIN_PLUS_GIVEN.update(load_int2int_nested("ADMIN_PLUS_GIVEN"))
-    ADMIN_MINUS_GIVEN.clear(); ADMIN_MINUS_GIVEN.update(load_int2int_nested("ADMIN_MINUS_GIVEN"))
+    ADMIN_PLUS_GIVEN.clear(); ADMIN_PLUS_GIVEN.update(nested_int_map_i(data.get("ADMIN_PLUS_GIVEN", {})))
+    ADMIN_MINUS_GIVEN.clear(); ADMIN_MINUS_GIVEN.update(nested_int_map_i(data.get("ADMIN_MINUS_GIVEN", {})))
 
     ACHIEVEMENTS.clear()
     for cid, per in data.get("ACHIEVEMENTS", {}).items():
-        cid_i = int(cid)
-        ACHIEVEMENTS[cid_i] = {int(uid): set(titles) for uid, titles in per.items()}
+        ACHIEVEMENTS[int(cid)] = {int(uid): set(titles) for uid, titles in per.items()}
 
 async def cloud_save():
     payload = _serialize_state()
@@ -462,7 +434,7 @@ async def cloud_save():
         try:
             await client.patch(url, json={"files": {GIST_FILENAME: {"content": text}}}, headers=headers)
         except Exception:
-            pass  # пробуем в следующий раз
+            pass  # попробуем в следующий раз
 
 async def cloud_load_if_any():
     # 1) пробуем Gist
@@ -795,7 +767,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if _achieve(chat_id, uid, "Сортирный поэт"):
             await _announce_achievement(context, chat_id, uid, "Сортирный поэт")
 
-# ========= ЭКСПОРТ / ИМПОРТ =========
+# ========= ЭКСПОРТ / ИМПОРТ / РЕСЕТ =========
 async def _ensure_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
     chat_id = update.effective_chat.id
     user_id = update.effective_user.id
@@ -829,7 +801,6 @@ async def cmd_export_here(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     snapshot = _serialize_state()
 
-    # вырежем только текущий чат
     def only_chat(section):
         return {str(chat_id): section.get(str(chat_id), {})}
 
@@ -856,7 +827,7 @@ async def cmd_export_here(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         "ADMIN_PLUS_GIVEN": only_chat(snapshot["ADMIN_PLUS_GIVEN"]),
         "ADMIN_MINUS_GIVEN": only_chat(snapshot["ADMIN_MINUS_GIVEN"]),
-        "ACHIEVEMENTS": only_chat(snapshot["ACHIEVEMENTS"]),
+        "ACHIEVEMENTS": only_chat(snapshot["ACHIEВEMENTS"]) if "ACHIEВEMENTS" in snapshot else only_chat(snapshot["ACHIEVEMENTS"]),
     }
 
     fname = f"export_chat_{chat_id}.json"
@@ -886,8 +857,8 @@ async def cmd_import(update: Update, context: ContextTypes.DEFAULT_TYPE):
             data = json.load(f)
 
         async with STATE_LOCK:
-            # Мягкий импорт: заливаем ТОЛЬКО текущий чат
             _apply_state(data, target_chat_id=chat_id, only_this_chat=True)
+            await cloud_save()
 
         await update.message.reply_text("Импорт завершён ✅ (только текущий чат)")
     except json.JSONDecodeError:
@@ -897,6 +868,100 @@ async def cmd_import(update: Update, context: ContextTypes.DEFAULT_TYPE):
     finally:
         try: os.remove(path)
         except Exception: pass
+
+# --- RESET HELPERS ---
+def _clear_user_in_chat(chat_id: int, uid: int):
+    # ники
+    if uid in NICKS.get(chat_id, {}):
+        old = NICKS[chat_id].pop(uid, None)
+        if old:
+            TAKEN.get(chat_id, set()).discard(old)
+    # репутация/счётчики/ачивки
+    for store in (REP_GIVEN, REP_RECEIVED, REP_POS_GIVEN, REP_NEG_GIVEN,
+                  MSG_COUNT, CHAR_COUNT, NICK_CHANGE_COUNT, EIGHTBALL_COUNT,
+                  TRIGGER_HITS, BEER_HITS, ADMIN_PLUS_GIVEN, ADMIN_MINUS_GIVEN):
+        if uid in store.get(chat_id, {}):
+            store[chat_id].pop(uid, None)
+    # окна/даты
+    if uid in LAST_MSG_AT.get(chat_id, {}):
+        LAST_MSG_AT[chat_id].pop(uid, None)
+    if uid in REP_GIVE_TIMES.get(chat_id, {}):
+        REP_GIVE_TIMES[chat_id].pop(uid, None)
+    # ачивки
+    if uid in ACHIEVEMENTS.get(chat_id, {}):
+        ACHIEVEMENTS[chat_id].pop(uid, None)
+
+def _clear_chat(chat_id: int):
+    NICKS[chat_id] = {}
+    TAKEN[chat_id] = set()
+
+    REP_GIVEN[chat_id] = {}
+    REP_RECEIVED[chat_id] = {}
+    REP_POS_GIVEN[chat_id] = {}
+    REP_NEG_GIVEN[chat_id] = {}
+    REP_GIVE_TIMES[chat_id] = {}
+
+    MSG_COUNT[chat_id] = {}
+    CHAR_COUNT[chat_id] = {}
+    NICK_CHANGE_COUNT[chat_id] = {}
+    EIGHTBALL_COUNT[chat_id] = {}
+    TRIGGER_HITS[chat_id] = {}
+    BEER_HITS[chat_id] = {}
+    LAST_MSG_AT[chat_id] = {}
+
+    ADMIN_PLUS_GIVEN[chat_id] = {}
+    ADMIN_MINUS_GIVEN[chat_id] = {}
+    ACHIEVEMENTS[chat_id] = {}
+
+# --- RESET COMMANDS (ADMIN ONLY) ---
+async def cmd_reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await _ensure_admin(update, context):
+        await update.message.reply_text("Только админ может сбрасывать историю 🚫")
+        return
+    chat_id = update.effective_chat.id
+    _ensure_chat(chat_id)
+    async with STATE_LOCK:
+        _clear_chat(chat_id)
+        await cloud_save()
+    await update.message.reply_text("🔄 История этого чата сброшена админом. Всё начинается заново!")
+
+async def cmd_resetuser(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await _ensure_admin(update, context):
+        await update.message.reply_text("Только админ может сбрасывать пользователей 🚫")
+        return
+    if not update.message:
+        return
+    chat_id = update.effective_chat.id
+    _ensure_chat(chat_id)
+
+    target_id: Optional[int] = None
+    target_name: Optional[str] = None
+
+    # 1) по реплаю
+    if update.message.reply_to_message and update.message.reply_to_message.from_user:
+        u = update.message.reply_to_message.from_user
+        target_id = u.id
+        target_name = _display_name(u)
+        await _remember_user(u)
+    else:
+        # 2) по аргументу @username
+        parts = (update.message.text or "").split()
+        if len(parts) >= 2 and parts[1].startswith("@"):
+            uid = KNOWN.get(parts[1][1:].lower())
+            if uid:
+                target_id = uid
+                target_name = parts[1]
+
+    if target_id is None:
+        await update.message.reply_text("Укажи кого чистим: ответь на его сообщение или напиши `/resetuser @username`",
+                                        parse_mode="Markdown")
+        return
+
+    async with STATE_LOCK:
+        _clear_user_in_chat(chat_id, target_id)
+        await cloud_save()
+
+    await update.message.reply_text(f"🔄 Данные пользователя {target_name or _name_or_id(target_id)} очищены админом.")
 
 # ========= СТАТИСТИКА =========
 def build_stats_text(chat_id: int) -> str:
@@ -951,7 +1016,6 @@ def healthz():
 
 def run_flask():
     port = int(os.getenv("PORT", 5000))
-    # threaded=True — быстрее отдаёт health-check; use_reloader=False — не плодим процессы
     app.run(host="0.0.0.0", port=port, threaded=True, use_reloader=False)
 
 # ========= JOBS =========
@@ -1001,6 +1065,8 @@ def main():
     application.add_handler(CommandHandler("export", cmd_export))
     application.add_handler(CommandHandler("export_here", cmd_export_here))
     application.add_handler(CommandHandler("import", cmd_import))
+    application.add_handler(CommandHandler("reset", cmd_reset))
+    application.add_handler(CommandHandler("resetuser", cmd_resetuser))
 
     # Кнопки
     application.add_handler(CallbackQueryHandler(on_button))
@@ -1010,8 +1076,11 @@ def main():
 
     # Периодические задачи: автосейв и keep-alive
     jq = application.job_queue
-    jq.run_repeating(periodic_save_job, interval=300, first=120)   # каждые 5 минут
-    jq.run_repeating(keepalive_job,     interval=240, first=60)    # самопинг раз в 4 минуты
+    if jq is not None:
+        jq.run_repeating(periodic_save_job, interval=300, first=120)   # каждые 5 минут
+        jq.run_repeating(keepalive_job,     interval=240, first=60)    # самопинг раз в 4 минуты
+    else:
+        print("WARNING: JobQueue is None (install python-telegram-bot[job-queue])")
 
     # Запуск polling
     from telegram import Update as TgUpdate
